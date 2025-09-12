@@ -45,6 +45,29 @@ class NeuralEvaluator:
         self.model = None
         self.feature_size = 32 + 8  # 32 squares + 8 additional features
         
+        self.directions = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+        self.adj_matrix = np.full((32, 4), -1, dtype=int)
+        for sq in range(32):
+            r, c = rc(sq + 1)
+            for d, (dr, dc) in enumerate(self.directions):
+                nr = r + dr
+                nc = c + dc
+                if 0 <= nr < 8 and 0 <= nc < 8 and (nr + nc) % 2 == 1:
+                    if (nr, nc) in idx_map:
+                        target_sq = idx_map[(nr, nc)] - 1
+                        self.adj_matrix[sq, d] = target_sq
+        
+        # Adam optimizer state variables
+        self.adam_m = {}  # First moment estimates
+        self.adam_v = {}  # Second moment estimates
+        self.adam_t = 0   # Time step counter
+        
+        # Position evaluation cache
+        self.eval_cache = {}  # hash(board_tuple, player) -> evaluation
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.max_cache_size = 10000  # Keep cache manageable
+        
         if model_path and os.path.exists(model_path):
             self.load_model(model_path)
         else:
@@ -64,6 +87,7 @@ class NeuralEvaluator:
             'W4': np.random.randn(32, 1) * 0.1,
             'b4': np.zeros(1, dtype=np.float32)
         }
+        self._init_adam_state()
     
     def board_to_features(self, board, player):
         """
@@ -78,74 +102,115 @@ class NeuralEvaluator:
         """
         features = np.zeros(self.feature_size, dtype=np.float32)
         
-        # Basic piece representation (squares 1-32)
-        for i in range(1, 33):  # checkers squares 1-32
-            piece = board[i]
-            if piece == 1:      # Black man
-                features[i-1] = 1.0
-            elif piece == 2:    # Black king
-                features[i-1] = 2.0
-            elif piece == -1:   # Red man
-                features[i-1] = -1.0
-            elif piece == -2:   # Red king
-                features[i-1] = -2.0
-            # Empty squares remain 0
+        board_np = np.array(board[1:33], dtype=np.float32)
+        features[:32] = board_np
         
-        # Additional strategic features (indices 32-39)
-        black_men = sum(1 for x in board[1:33] if x == 1)
-        black_kings = sum(1 for x in board[1:33] if x == 2)
-        red_men = sum(1 for x in board[1:33] if x == -1)
-        red_kings = sum(1 for x in board[1:33] if x == -2)
-        
-        total_pieces = black_men + black_kings + red_men + red_kings
-        
-        features[32] = black_men / 12.0        # Normalized black men count
-        features[33] = black_kings / 12.0      # Normalized black kings count
-        features[34] = red_men / 12.0          # Normalized red men count
-        features[35] = red_kings / 12.0        # Normalized red kings count
-        features[36] = total_pieces / 24.0     # Game phase (endgame indicator)
+        # Piece counts
+        features[32] = np.sum(board_np == 1) / 12.0   # black men
+        features[33] = np.sum(board_np == 2) / 12.0   # black kings
+        features[34] = np.sum(board_np == -1) / 12.0  # red men
+        features[35] = np.sum(board_np == -2) / 12.0  # red kings
+        features[36] = np.count_nonzero(board_np) / 24.0  # total pieces
         features[37] = player                  # Current player to move
         
         # Simple mobility features
-        features[38] = self._calculate_mobility_feature(board, 1)   # Black mobility
-        features[39] = self._calculate_mobility_feature(board, -1)  # Red mobility
+        features[38] = self._calculate_mobility_feature(board_np, 1)   # Black mobility
+        features[39] = self._calculate_mobility_feature(board_np, -1)  # Red mobility
         
-        return features.astype(np.float32)
+        return features
     
-    def _calculate_mobility_feature(self, board, player):
+    def augment_position(self, board, player):
+        """
+        Create data augmentation by flipping the board horizontally.
+        This doubles the effective training data for free.
+        
+        Args:
+            board: Original board state
+            player: Current player
+            
+        Returns:
+            tuple: (flipped_board, flipped_player) - the horizontally flipped position
+        """
+        flipped_board = [0] * len(board)
+        
+        # Horizontal flip mapping for checkers squares
+        # Column mapping: 0->7, 1->6, 2->5, 3->4, 4->3, 5->2, 6->1, 7->0
+        flip_map = {}
+        for i in range(1, 33):
+            r, c = rc(i)
+            flipped_c = 7 - c
+            if (r, flipped_c) in idx_map:
+                flip_map[i] = idx_map[(r, flipped_c)]
+        
+        # Copy flipped pieces
+        for i in range(1, 33):
+            if i in flip_map:
+                flipped_board[flip_map[i]] = board[i]
+        
+        return flipped_board, player
+    
+    def _get_position_hash(self, board, player):
+        """Create a hash key for position caching"""
+        # Convert board to tuple (hashable) and combine with player
+        board_tuple = tuple(board)
+        return hash((board_tuple, player))
+    
+    def _manage_cache_size(self):
+        """Keep cache size under control by removing oldest entries"""
+        if len(self.eval_cache) > self.max_cache_size:
+            # Remove 20% of oldest entries (simple FIFO approach)
+            items_to_remove = len(self.eval_cache) // 5
+            keys_to_remove = list(self.eval_cache.keys())[:items_to_remove]
+            for key in keys_to_remove:
+                del self.eval_cache[key]
+    
+    def get_cache_stats(self):
+        """Get cache performance statistics"""
+        total = self.cache_hits + self.cache_misses
+        hit_rate = (self.cache_hits / total * 100) if total > 0 else 0
+        return {
+            'hits': self.cache_hits,
+            'misses': self.cache_misses,
+            'hit_rate': hit_rate,
+            'cache_size': len(self.eval_cache)
+        }
+    
+    def clear_cache(self):
+        """Clear the evaluation cache"""
+        self.eval_cache.clear()
+        self.cache_hits = 0
+        self.cache_misses = 0
+    
+    def _calculate_mobility_feature(self, board_np, color):
         """Calculate a simple mobility feature for the neural network"""
-        mobility = 0
-        for pos in range(1, 33):
-            if board[pos] != 0 and (board[pos] * player > 0):
-                # Count basic moves (simplified)
-                piece = board[pos]
-                r, c = rc(pos)
-                
-                # Check diagonal moves based on piece type
-                if abs(piece) == 2:  # King
-                    directions = [(-1,-1), (-1,1), (1,-1), (1,1)]
-                elif piece == 1:  # Black man
-                    directions = [(-1,-1), (-1,1)]
-                else:  # Red man
-                    directions = [(1,-1), (1,1)]
-                
-                for dr, dc in directions:
-                    nr, nc = r + dr, c + dc
-                    if 0 <= nr < 8 and 0 <= nc < 8 and (nr + nc) % 2 == 1:
-                        if (nr, nc) in idx_map:
-                            target_idx = idx_map[(nr, nc)]
-                            if board[target_idx] == 0:
-                                mobility += 1
+        own = (board_np * color > 0).astype(np.float32)
+        is_king = (np.abs(board_np) == 2).astype(np.float32)
+        is_man = 1.0 - is_king
         
-        return mobility / 20.0  # Normalize
+        # Compute empty adjacent squares for all directions
+        empty_adj = np.zeros((32, 4), dtype=np.float32)
+        for d in range(4):
+            mask = self.adj_matrix[:, d] != -1
+            targets = self.adj_matrix[:, d][mask]
+            empty_adj[mask, d] = (board_np[targets] == 0).astype(np.float32)
+        
+        total_adj = np.sum(empty_adj, axis=1)
+        
+        # Kings mobility (all directions)
+        kings_mobility = np.sum(total_adj * own * is_king)
+        
+        # Men mobility (forward directions only)
+        if color == 1:
+            man_slice = slice(0, 2)
+        else:
+            man_slice = slice(2, 4)
+        men_adj = np.sum(empty_adj[:, man_slice], axis=1)
+        men_mobility = np.sum(men_adj * own * is_man)
+        
+        mobility = (kings_mobility + men_mobility) / 20.0
+        return mobility
     
-    def _relu(self, x):
-        """ReLU activation function"""
-        return np.maximum(0, x)
     
-    def _tanh(self, x):
-        """Tanh activation function"""
-        return np.tanh(x)
     
     def predict(self, features):
         """
@@ -159,19 +224,19 @@ class NeuralEvaluator:
         """
         # Layer 1
         z1 = np.dot(features, self.weights['W1']) + self.weights['b1']
-        a1 = self._relu(z1)
+        a1 = z1 * (z1 > 0)
         
         # Layer 2
         z2 = np.dot(a1, self.weights['W2']) + self.weights['b2']
-        a2 = self._relu(z2)
+        a2 = z2 * (z2 > 0)
         
         # Layer 3
         z3 = np.dot(a2, self.weights['W3']) + self.weights['b3']
-        a3 = self._relu(z3)
+        a3 = z3 * (z3 > 0)
         
         # Output layer
         z4 = np.dot(a3, self.weights['W4']) + self.weights['b4']
-        output = self._tanh(z4) * 1000  # Scale to reasonable evaluation range
+        output = np.tanh(z4) * 1000  # Scale to reasonable evaluation range
         
         return float(output[0])
     
@@ -192,7 +257,7 @@ class NeuralEvaluator:
         _, _, _, _, _, _, _, y = self._forward_batch(X)
         return y.reshape(-1)
     
-    def train_supervised(self, positions, targets, epochs=1, batch_size=1024, lr=1e-3, l2=1e-6, shuffle=True, verbose=True):
+    def train_supervised(self, positions, targets, epochs=1, batch_size=1024, lr=2e-4, l2=1e-6, shuffle=True, verbose=True):
         """
         Simple supervised training using MSE loss between network output and target score.
         targets are expected in [-1, 1] (game outcome from player's perspective), and we scale by 1000.
@@ -256,15 +321,14 @@ class NeuralEvaluator:
                 dW1 = xb.T @ gz1 + l2 * self.weights['W1']
                 db1 = np.sum(gz1, axis=0)
 
-                # SGD update
-                self.weights['W4'] -= lr * dW4
-                self.weights['b4'] -= lr * db4
-                self.weights['W3'] -= lr * dW3
-                self.weights['b3'] -= lr * db3
-                self.weights['W2'] -= lr * dW2
-                self.weights['b2'] -= lr * db2
-                self.weights['W1'] -= lr * dW1
-                self.weights['b1'] -= lr * db1
+                # Adam update
+                gradients = {
+                    'W4': dW4, 'b4': db4,
+                    'W3': dW3, 'b3': db3, 
+                    'W2': dW2, 'b2': db2,
+                    'W1': dW1, 'b1': db1
+                }
+                self._adam_update(gradients, lr)
 
             if verbose:
                 avg_loss = total_loss / max(1, total_count)
@@ -275,6 +339,7 @@ class NeuralEvaluator:
     def evaluate_position(self, board, player):
         """
         Main evaluation function that replaces the hand-crafted eval.
+        Now includes caching for improved performance.
         
         Args:
             board: Board state
@@ -283,21 +348,87 @@ class NeuralEvaluator:
         Returns:
             Evaluation score from player's perspective (float)
         """
+        # Check cache first
+        cache_key = self._get_position_hash(board, player)
+        if cache_key in self.eval_cache:
+            self.cache_hits += 1
+            return self.eval_cache[cache_key]
+        
+        # Cache miss - compute evaluation
+        self.cache_misses += 1
+        
         features = self.board_to_features(board, player)
         raw_score = self.predict(features)
         # Return score from current player's perspective
-        return player * raw_score
+        result = player * raw_score
+        
+        # Store in cache
+        self.eval_cache[cache_key] = result
+        self._manage_cache_size()
+        
+        return result
+    
+    def _init_adam_state(self):
+        """Initialize Adam optimizer state variables"""
+        self.adam_m = {}
+        self.adam_v = {}
+        for key in self.weights:
+            self.adam_m[key] = np.zeros_like(self.weights[key])
+            self.adam_v[key] = np.zeros_like(self.weights[key])
+        self.adam_t = 0
+    
+    def _adam_update(self, gradients, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        """Apply Adam optimizer update"""
+        self.adam_t += 1
+        
+        for key in gradients:
+            # Update biased first moment estimate
+            self.adam_m[key] = beta1 * self.adam_m[key] + (1 - beta1) * gradients[key]
+            
+            # Update biased second raw moment estimate
+            self.adam_v[key] = beta2 * self.adam_v[key] + (1 - beta2) * (gradients[key] ** 2)
+            
+            # Compute bias-corrected first moment estimate
+            m_hat = self.adam_m[key] / (1 - beta1 ** self.adam_t)
+            
+            # Compute bias-corrected second raw moment estimate
+            v_hat = self.adam_v[key] / (1 - beta2 ** self.adam_t)
+            
+            # Update parameters
+            self.weights[key] -= lr * m_hat / (np.sqrt(v_hat) + eps)
     
     def save_model(self, filepath):
-        """Save the neural network weights"""
+        """Save the neural network weights and Adam state"""
+        model_data = {
+            'weights': self.weights,
+            'adam_m': self.adam_m,
+            'adam_v': self.adam_v,
+            'adam_t': self.adam_t
+        }
         with open(filepath, 'wb') as f:
-            pickle.dump(self.weights, f)
+            pickle.dump(model_data, f)
         print(f"Neural model saved to: {filepath}")
     
     def load_model(self, filepath):
-        """Load neural network weights"""
+        """Load neural network weights and Adam state"""
         with open(filepath, 'rb') as f:
-            self.weights = pickle.load(f)
+            data = pickle.load(f)
+        
+        if isinstance(data, dict) and 'weights' in data:
+            # New format with Adam state
+            self.weights = data['weights']
+            self.adam_m = data.get('adam_m', {})
+            self.adam_v = data.get('adam_v', {})
+            self.adam_t = data.get('adam_t', 0)
+            
+            # Initialize Adam state if missing or incomplete
+            if not self.adam_m or not self.adam_v:
+                self._init_adam_state()
+        else:
+            # Old format - just weights
+            self.weights = data
+            self._init_adam_state()
+            
         print(f"Neural model loaded from: {filepath}")
 
 
@@ -326,9 +457,10 @@ def evaluate_neural(board, player):
 class TrainingDataCollector:
     """Helper class to collect training data from games"""
     
-    def __init__(self):
+    def __init__(self, use_augmentation=True):
         self.positions = []
         self.scores = []
+        self.use_augmentation = use_augmentation
     
     def add_position(self, board, player, game_result):
         """
@@ -340,13 +472,22 @@ class TrainingDataCollector:
             game_result: Final game result (1.0 for black win, -1.0 for red win, 0.0 for draw)
         """
         evaluator = get_neural_evaluator()
-        features = evaluator.board_to_features(board, player)
         
-        # Score from current player's perspective in [-1, 0, 1]
-        score = player * game_result
+        # Original position
+        features = evaluator.board_to_features(board, player)
+        score = player * game_result  # Score from current player's perspective in [-1, 0, 1]
         
         self.positions.append(features)
         self.scores.append(score)
+        
+        # Add augmented position if enabled
+        if self.use_augmentation:
+            flipped_board, flipped_player = evaluator.augment_position(board, player)
+            flipped_features = evaluator.board_to_features(flipped_board, flipped_player)
+            flipped_score = flipped_player * game_result
+            
+            self.positions.append(flipped_features)
+            self.scores.append(flipped_score)
     
     def save_training_data(self, filepath):
         """Save collected training data"""

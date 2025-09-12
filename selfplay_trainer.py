@@ -20,9 +20,9 @@ class SelfPlayTrainer:
     supervised updates to the base network.
     """
     
-    def __init__(self, base_evaluator=None):
+    def __init__(self, base_evaluator=None, resume_from_checkpoint=None):
         self.base_evaluator = base_evaluator or get_neural_evaluator()
-        self.training_data = TrainingDataCollector()
+        self.training_data = TrainingDataCollector(use_augmentation=True)
         self.games_played = 0
         self.total_positions = 0
         self.training_stats = {
@@ -33,13 +33,20 @@ class SelfPlayTrainer:
             'positions_collected': 0
         }
         
-    def create_opponent_evaluator(self, noise_level=0.1, mutation_rate=0.05):
+        # Load previous training progress if specified
+        if resume_from_checkpoint:
+            self.load_checkpoint(resume_from_checkpoint)
+        
+    def create_opponent_evaluator(self, noise_level=0.3, mutation_rate=0.15):
         """
         Create a slightly different version of the evaluator for opponent play.
         This introduces diversity in self-play games.
         """
         opponent = NeuralEvaluator()
-        opponent.weights = deepcopy(self.base_evaluator.weights)
+        opponent.weights = {k: v.copy() if isinstance(v, np.ndarray) else deepcopy(v) for k, v in self.base_evaluator.weights.items()}
+        
+        # Use random seed based on time to ensure different opponents
+        np.random.seed(None)  # Use current time as seed
         
         # Add noise to create variation
         for layer in opponent.weights:
@@ -84,7 +91,7 @@ class SelfPlayTrainer:
                 break
                 
             # Store position before move
-            game_positions.append((deepcopy(board), player))
+            game_positions.append((board[:], player))
             
             # Choose engine based on player
             current_engine = engine1 if player == 1 else engine2
@@ -162,12 +169,15 @@ class SelfPlayTrainer:
         )
         return stats
     
-    def run_training_session(self, num_games=100, save_interval=25, 
-                           model_save_path="neural_model.pkl", 
-                           data_save_path="training_data.pkl"):
+    def run_training_session(self, num_games=100, save_interval=10,
+                           model_save_path="neural_model.pkl",
+                           data_save_path="training_data.pkl",
+                           checkpoint_path="training_checkpoint.pkl",
+                           progress_callback=None):
         """
         Run a complete self-play training session.
         """
+        random.seed(int(time.time()))
         print(f"Starting self-play training session: {num_games} games")
         print(f"Model will be saved to: {model_save_path}")
         print(f"Training data will be saved to: {data_save_path}")
@@ -187,6 +197,10 @@ class SelfPlayTrainer:
                       f"Moves: {moves:3d} | Positions: {positions:3d} | "
                       f"Time: {game_time:.2f}s")
             
+            # Report progress
+            if progress_callback:
+                progress_callback(game_num + 1, num_games)
+            
             # Save progress and train periodically
             if (game_num + 1) % save_interval == 0:
                 # Train on the data collected so far
@@ -194,11 +208,15 @@ class SelfPlayTrainer:
                 if stats and stats.get("loss") is not None:
                     print(f"Post-chunk training: MSE {stats['loss']:.4f} on {stats['count']} samples")
                 # Save progress
-                self.save_training_progress(model_save_path, data_save_path)
+                self.save_training_progress(model_save_path, data_save_path, checkpoint_path)
                 self.print_training_stats()
                 print("-" * 60)
                 # Optionally clear data to avoid overfitting on same samples repeatedly
                 self.training_data.clear()
+        
+        # Final report
+        if progress_callback:
+            progress_callback(num_games, num_games)
         
         # Final train and save
         if len(self.training_data.positions) > 0:
@@ -206,7 +224,7 @@ class SelfPlayTrainer:
             if stats and stats.get("loss") is not None:
                 print(f"Final training: MSE {stats['loss']:.4f} on {stats['count']} samples")
 
-        self.save_training_progress(model_save_path, data_save_path)
+        self.save_training_progress(model_save_path, data_save_path, checkpoint_path)
         
         elapsed_time = time.time() - start_time
         print(f"\nTraining session completed!")
@@ -214,19 +232,92 @@ class SelfPlayTrainer:
         print(f"Games per second: {num_games / max(1e-9, elapsed_time):.2f}")
         self.print_training_stats()
     
-    def save_training_progress(self, model_path, data_path):
-        """Save current training progress and model state."""
-        # Save the neural network model
-        self.base_evaluator.save_model(model_path)
+    def save_checkpoint(self, checkpoint_path):
+        """
+        Save complete training checkpoint including model, stats, and collected data.
+        """
+        checkpoint_data = {
+            'games_played': self.games_played,
+            'total_positions': self.total_positions,
+            'training_stats': self.training_stats,
+            'collected_positions': np.array(self.training_data.positions) if self.training_data.positions else np.array([]),
+            'collected_scores': np.array(self.training_data.scores) if self.training_data.scores else np.array([]),
+            'model_weights': self.base_evaluator.weights,
+            'adam_state': {
+                'adam_m': self.base_evaluator.adam_m,
+                'adam_v': self.base_evaluator.adam_v,
+                'adam_t': self.base_evaluator.adam_t
+            }
+        }
         
-        # Save training data
-        self.training_data.save_training_data(data_path)
+        with open(checkpoint_path, 'wb') as f:
+            pickle.dump(checkpoint_data, f)
+        print(f"Training checkpoint saved to: {checkpoint_path}")
+    
+    def load_checkpoint(self, checkpoint_path):
+        """
+        Load training checkpoint and resume from where we left off.
+        """
+        if not os.path.exists(checkpoint_path):
+            print(f"Checkpoint file not found: {checkpoint_path}")
+            return False
         
-        # Save training statistics
-        stats_path = data_path.replace('.pkl', '_stats.pkl')
-        with open(stats_path, 'wb') as f:
-            pickle.dump(self.training_stats, f)
-        print(f"Training stats saved to: {stats_path}")
+        try:
+            with open(checkpoint_path, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+            
+            # Restore training progress
+            self.games_played = checkpoint_data.get('games_played', 0)
+            self.total_positions = checkpoint_data.get('total_positions', 0)
+            self.training_stats = checkpoint_data.get('training_stats', {
+                'black_wins': 0, 'red_wins': 0, 'draws': 0,
+                'avg_game_length': 0, 'positions_collected': 0
+            })
+            
+            # Restore collected training data
+            positions = checkpoint_data.get('collected_positions', np.array([]))
+            scores = checkpoint_data.get('collected_scores', np.array([]))
+            if len(positions) > 0:
+                self.training_data.positions = positions.tolist()
+                self.training_data.scores = scores.tolist()
+            
+            # Restore model state
+            if 'model_weights' in checkpoint_data:
+                self.base_evaluator.weights = checkpoint_data['model_weights']
+            
+            # Restore Adam optimizer state
+            adam_state = checkpoint_data.get('adam_state', {})
+            if adam_state:
+                self.base_evaluator.adam_m = adam_state.get('adam_m', {})
+                self.base_evaluator.adam_v = adam_state.get('adam_v', {})
+                self.base_evaluator.adam_t = adam_state.get('adam_t', 0)
+            
+            print(f"Training checkpoint loaded from: {checkpoint_path}")
+            print(f"Resuming from game {self.games_played + 1} with {self.total_positions} collected positions")
+            return True
+            
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            return False
+    
+    def save_training_progress(self, model_save_path="neural_model.pkl", data_save_path="training_data.pkl", checkpoint_path="training_checkpoint.pkl"):
+        """Save model, training data, and checkpoint after training chunk."""
+        # Save updated model (full evaluator)
+        with open(model_save_path, 'wb') as f:
+            pickle.dump(self.base_evaluator, f)
+        print(f"Model saved to: {model_save_path}")
+        
+        # Save training data (positions and scores)
+        data_to_save = {
+            'positions': self.training_data.positions,
+            'scores': self.training_data.scores
+        }
+        with open(data_save_path, 'wb') as f:
+            pickle.dump(data_to_save, f)
+        print(f"Training data saved to: {data_save_path}")
+        
+        # Save checkpoint (stats, partial data, model state)
+        self.save_checkpoint(checkpoint_path)
     
     def print_training_stats(self):
         """Print current training statistics."""

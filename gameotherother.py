@@ -5,6 +5,7 @@
 # Now supports optional neural evaluation via SearchEngine.neural_evaluator
 
 from copy import deepcopy
+import collections
 import math
 import sys
 import re
@@ -118,34 +119,69 @@ def simple_moves_from(b, pos):
     return moves
 
 def jumps_from(b, pos):
-    # Fast in-place DFS without copying the whole board each step
+    # Iterative in-place DFS for multi-jumps without recursion
     results = []
     piece = b[pos]
     if piece == 0:
         return results
 
-    def rec(cur_pos, seq):
-        any_jump = False
-        p = b[cur_pos]
-        for d in dir_indices_for(p):
-            mid = JUMP_MID[cur_pos][d]
-            to = JUMP_DST[cur_pos][d]
-            if mid and to:
-                vm = b[mid]
-                if vm != 0 and (vm * p < 0) and b[to] == 0:
-                    # do jump
-                    b[cur_pos] = 0
-                    b[mid] = 0
-                    b[to] = p
-                    rec(to, seq + [to])
-                    # undo
-                    b[to] = 0
-                    b[mid] = vm
-                    b[cur_pos] = p
-                    any_jump = True
-        if not any_jump and len(seq) > 1:
-            results.append(seq)
-    rec(pos, [pos])
+    directions = dir_indices_for(piece)
+    num_dirs = len(directions)
+
+    # Stack: (cur_pos, seq_start_idx, changed_start_idx, d_idx)
+    # seq and changed are global lists, append/pop for backtrack
+    seq = [pos]
+    changed = []
+    stack = [(pos, 0, 0, 0)]  # start with d_idx=0
+
+    while stack:
+        cur_pos, seq_start, changed_start, d_idx = stack[-1]
+        p = piece  # fixed
+
+        if d_idx == num_dirs:
+            # All directions tried, check if leaf
+            stack.pop()
+            if len(seq) > 1:
+                results.append(seq[seq_start:])  # copy relevant seq
+            # Backtrack changes from changed_start
+            for i in range(len(changed) - 1, changed_start - 1, -1):
+                idx, old_val = changed[i]
+                b[idx] = old_val
+            changed = changed[:changed_start]
+            seq = seq[:seq_start]
+            continue
+
+        # Try current direction
+        d = directions[d_idx]
+        mid = JUMP_MID[cur_pos][d]
+        to = JUMP_DST[cur_pos][d]
+        can_jump = mid and to and b[mid] != 0 and (b[mid] * p < 0) and b[to] == 0
+
+        if can_jump:
+            # Save state
+            old_cur = b[cur_pos]
+            old_mid = b[mid]
+            old_to = b[to]
+
+            # Do jump
+            b[cur_pos] = 0
+            b[mid] = 0
+            b[to] = p
+
+            # Append to seq and changed
+            seq.append(to)
+            changed.append((cur_pos, old_cur))
+            changed.append((mid, old_mid))
+            changed.append((to, old_to))
+
+            # Increment d_idx for current, push new branch
+            stack[-1] = (cur_pos, seq_start, changed_start, d_idx + 1)
+            # New state for branch
+            stack.append((to, len(seq) - 1, len(changed) - 3, 0))
+        else:
+            # No jump, next direction
+            stack[-1] = (cur_pos, seq_start, changed_start, d_idx + 1)
+
     return results
 
 def legal_moves(b, player):
@@ -333,7 +369,8 @@ class SearchEngine:
         # Zobrist keys
         self.z_piece = [[self.rand.getrandbits(64) for _ in range(4)] for _ in range(SQUARES + 1)]
         self.z_side = self.rand.getrandbits(64)
-        self.tt = {}  # hash -> (depth, value, flag, best_move)
+        self.tt = collections.OrderedDict()  # hash -> (depth, value, flag, best_move)
+        self.tt_max_size = 1 << 20  # 1M entries
         self.max_ply = 0
         self.nodes = 0
         self.killers = []  # [ [m1, m2], ... ]
@@ -343,6 +380,8 @@ class SearchEngine:
         self.hash = 0
         self.side = 1
         self.root_best_move = None
+        self.total_pieces = 0
+        self.move_cache = collections.OrderedDict()
 
         # Optional neural evaluator: if set (object with evaluate_position(board, player)),
         # the engine will use it instead of the built-in evaluate().
@@ -365,6 +404,7 @@ class SearchEngine:
         self.nodes = 0
         self.max_ply = depth + 64
         self.killers = [[None, None] for _ in range(self.max_ply)]
+        self.total_pieces = sum(1 for x in self.board[1:] if x != 0)
         # Keep TT and history across moves for better performance
 
     def _eval(self, b, side):
@@ -453,7 +493,15 @@ class SearchEngine:
         self.hash ^= self.z_piece[frm][piece_index(piece)]
 
     def gen_moves(self, side):
-        return legal_moves(self.board, side)
+        key = (self.hash, side)
+        if key in self.move_cache:
+            self.move_cache.move_to_end(key)
+            return self.move_cache[key]
+        moves = legal_moves(self.board, side)
+        self.move_cache[key] = moves
+        if len(self.move_cache) > 5000:
+            self.move_cache.popitem(last=False)
+        return moves
 
     def gen_captures_only(self, side):
         # Generate only capture sequences
@@ -538,6 +586,23 @@ class SearchEngine:
                     beta = tt_value
                 if alpha >= beta:
                     return tt_value
+            # Move to end for LRU
+            self.tt.move_to_end(self.hash)
+
+        # Null-move pruning
+        if depth >= 3 and self.total_pieces > 10:
+            self.side = -self.side
+            self.hash ^= self.z_side
+            null_score = -self.negamax(depth - 3, ply + 1, -beta, -beta + 1, False)
+            self.side = -self.side
+            self.hash ^= self.z_side
+            if null_score >= beta:
+                # Store cutoff in TT
+                self.tt.move_to_end(self.hash)
+                self.tt[self.hash] = (depth, beta, "LOWER", None)
+                if len(self.tt) > self.tt_max_size:
+                    self.tt.popitem(last=False)
+                return beta
 
         if depth == 0:
             return self.quiescence(alpha, beta, ply)
@@ -590,21 +655,35 @@ class SearchEngine:
                     frm = m[0]; to = m[-1]
                     self.history[(self.side, frm, to)] = self.history.get((self.side, frm, to), 0) + depth * depth
                 # TT store as lower bound (beta cutoff)
+                self.tt.move_to_end(self.hash)
                 self.tt[self.hash] = (depth, best_val, "LOWER", best_move)
+                if len(self.tt) > self.tt_max_size:
+                    self.tt.popitem(last=False)
                 return best_val
 
         # Store in TT
         flag = "EXACT" if best_val > orig_alpha and best_val < beta else ("UPPER" if best_val <= orig_alpha else "LOWER")
+        self.tt.move_to_end(self.hash)
         self.tt[self.hash] = (depth, best_val, flag, best_move)
+        if len(self.tt) > self.tt_max_size:
+            self.tt.popitem(last=False)
         return best_val
 
     def search(self, b, player, depth):
         self.reset_search(b, player, depth)
         best_val = -INF
         self.root_best_move = None
-        # Iterative deepening
+        # Iterative deepening with aspiration windows
+        prev_val = -INF
+        aspiration_margin = 100
         for d in range(1, depth + 1):
-            val = self.negamax(d, 0, -INF, INF, True)
+            alpha = max(-INF, prev_val - aspiration_margin)
+            beta = min(INF, prev_val + aspiration_margin)
+            val = self.negamax(d, 0, alpha, beta, True)
+            # If outside window, re-search with full window
+            if val <= alpha or val >= beta:
+                val = self.negamax(d, 0, -INF, INF, True)
+            prev_val = val
             best_val = val
             # Keep principal variation move cached in TT; root_best_move updated inside negamax
             if self.root_best_move is None:

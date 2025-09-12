@@ -618,26 +618,35 @@ class CheckersUI(tk.Tk):
         self._set_controls_state(False)
         self.btn_train.configure(text="Training...")
 
-        # Ask user for number of games
+        # Ask user for number of games with increased default
         try:
             import tkinter.simpledialog as simpledialog
             num_games = simpledialog.askinteger("Training Setup", 
                                                 "Number of self-play games:",
-                                                initialvalue=50, minvalue=1, maxvalue=2000)
+                                                initialvalue=200, minvalue=10, maxvalue=5000)
             if not num_games:
                 self.training_active = False
                 self._set_controls_state(True)
                 self.btn_train.configure(text="Train AI")
                 return
         except Exception:
-            num_games = 50
+            num_games = 200
+        
+        # Create progress window
+        self._create_progress_window(num_games)
 
         def worker():
             try:
                 trainer = SelfPlayTrainer()
-                trainer.run_training_session(num_games=num_games, save_interval=max(10, num_games//5))
+                # Define progress callback
+                def progress_cb(games, total):
+                    self.after(0, lambda: self._update_progress(games, total))
+                # Monitor progress and update UI
+                save_interval = max(25, num_games//8)
+                trainer.run_training_session(num_games=num_games, save_interval=save_interval, progress_callback=progress_cb)
             except Exception as e:
-                self.after(0, lambda: self._training_error(str(e)))
+                error_str = str(e)
+                self.after(0, lambda: self._training_error(error_str))
                 return
             self.after(0, self._training_completed)
 
@@ -647,6 +656,11 @@ class CheckersUI(tk.Tk):
         self.training_active = False
         self._set_controls_state(True)
         self.btn_train.configure(text="Train AI")
+        
+        # Close progress window
+        if hasattr(self, 'progress_window'):
+            self.progress_window.destroy()
+        
         # If neural eval is enabled, keep using the (now updated) evaluator
         if self.use_neural_var.get():
             self.engine.neural_evaluator = get_neural_evaluator()
@@ -658,9 +672,53 @@ class CheckersUI(tk.Tk):
         self.training_active = False
         self._set_controls_state(True)
         self.btn_train.configure(text="Train AI")
+        
+        # Close progress window
+        if hasattr(self, 'progress_window'):
+            self.progress_window.destroy()
+        
         messagebox.showerror("Training Error", f"Training failed: {error_msg}")
 
 # -------------------- Run --------------------
+
+    def _create_progress_window(self, num_games):
+        self.progress_window = tk.Toplevel(self)
+        self.progress_window.title("Training Progress")
+        self.progress_window.geometry("350x120")
+        self.progress_window.transient(self)
+        self.progress_window.grab_set()
+        self.progress_window.resizable(False, False)
+        
+        ttk.Label(self.progress_window,
+                  text="Self-Play Training in Progress...",
+                  font=("Segoe UI", 10, "bold")).pack(pady=10)
+        
+        self.progress_label = ttk.Label(self.progress_window,
+                                        text=f"Completed 0/{num_games} games")
+        self.progress_label.pack(pady=5)
+        
+        self.progress_bar = ttk.Progressbar(self.progress_window,
+                                            mode='determinate',
+                                            maximum=num_games,
+                                            length=300)
+        self.progress_bar.pack(pady=10)
+        
+        ttk.Button(self.progress_window,
+                   text="Cancel",
+                   command=self._cancel_training).pack(pady=5)
+    
+    def _update_progress(self, games, total):
+        self.progress_label.config(text=f"Completed {games}/{total} games")
+        self.progress_bar['value'] = games
+    
+    def _cancel_training(self):
+        """Cancel training by setting flag and closing window."""
+        self.training_active = False
+        if hasattr(self, 'progress_window'):
+            self.progress_window.destroy()
+        self._set_controls_state(True)
+        self.btn_train.configure(text="Train AI")
+        # Note: Daemon thread will continue but window is closed
 
 if __name__ == "__main__":
     app = CheckersUI()
