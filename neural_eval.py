@@ -8,6 +8,28 @@ import os
 import random
 from copy import deepcopy
 
+# Optional imports for optimization
+has_numba = False
+try:
+    import numba
+    has_numba = True
+except ImportError:
+    pass
+
+has_cupy = False
+try:
+    import cupy as cp
+    has_cupy = True
+except ImportError:
+    pass
+
+has_torch = False
+try:
+    import torch
+    has_torch = True
+except ImportError:
+    pass
+
 # Import board utilities from the main game module
 try:
     from gameotherother import rc, idx_map, SQUARES
@@ -36,7 +58,8 @@ except ImportError:
 
 class NeuralEvaluator:
     """
-    Neural network-based position evaluation for checkers.
+    Optimized Neural network-based position evaluation for checkers.
+    Vectorized forward pass, optional numba/GPU acceleration.
     Replaces the hand-crafted evaluation function.
     Also supports simple supervised training on self-play data.
     """
@@ -44,6 +67,20 @@ class NeuralEvaluator:
     def __init__(self, model_path=None):
         self.model = None
         self.feature_size = 32 + 8  # 32 squares + 8 additional features
+
+        # Optimization flags
+        self.has_numba = has_numba
+        self.has_cupy = has_cupy
+        self.has_torch = has_torch
+
+        if self.has_numba:
+            try:
+                self._board_to_features_fast = numba.jit(nopython=True)(self._board_to_features_fast)
+            except Exception as e:
+                print(f"Warning: Could not apply Numba JIT to _board_to_features_fast: {e}")
+
+        if self.has_torch:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         self.directions = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
         self.adj_matrix = np.full((32, 4), -1, dtype=int)
@@ -78,13 +115,13 @@ class NeuralEvaluator:
         """Initialize a simple neural network as placeholder"""
         np.random.seed(42)
         self.weights = {
-            'W1': np.random.randn(self.feature_size, 128) * 0.1,
+            'W1': (np.random.randn(self.feature_size, 128) * 0.1).astype(np.float32),
             'b1': np.zeros(128, dtype=np.float32),
-            'W2': np.random.randn(128, 64) * 0.1,
+            'W2': (np.random.randn(128, 64) * 0.1).astype(np.float32),
             'b2': np.zeros(64, dtype=np.float32),
-            'W3': np.random.randn(64, 32) * 0.1,
+            'W3': (np.random.randn(64, 32) * 0.1).astype(np.float32),
             'b3': np.zeros(32, dtype=np.float32),
-            'W4': np.random.randn(32, 1) * 0.1,
+            'W4': (np.random.randn(32, 1) * 0.1).astype(np.float32),
             'b4': np.zeros(1, dtype=np.float32)
         }
         self._init_adam_state()
@@ -100,41 +137,81 @@ class NeuralEvaluator:
         Returns:
             numpy array of features
         """
-        features = np.zeros(self.feature_size, dtype=np.float32)
+        return self.board_to_features_batch(np.array([board]), np.array([player]))[0]
+
+    def _board_to_features_fast(self, boards, players):
+        """Optimized feature extraction using NumPy (JIT fallback if available)."""
+        N = len(boards)
+        features = np.zeros((N, self.feature_size), dtype=np.float32)
+    
+        board_states = boards[:, 1:33]
+        features[:, :32] = board_states
+    
+        features[:, 32] = np.sum(board_states == 1, axis=1) / 12.0  # black men
+        features[:, 33] = np.sum(board_states == 2, axis=1) / 12.0  # black kings
+        features[:, 34] = np.sum(board_states == -1, axis=1) / 12.0 # red men
+        features[:, 35] = np.sum(board_states == -2, axis=1) / 12.0 # red kings
+        features[:, 36] = np.sum(board_states != 0, axis=1) / 24.0  # total pieces
+        features[:, 37] = players  # Current player to move
+    
+        # Mobility features
+        for i in range(N):
+            features[i, 38] = self._calculate_mobility_feature(board_states[i], 1)  # Black
+            features[i, 39] = self._calculate_mobility_feature(board_states[i], -1) # Red
+    
+        return features
+
+    def board_to_features_batch(self, boards, players):
+        """
+        Vectorized feature extraction for batch of boards.
         
-        board_np = np.array(board[1:33], dtype=np.float32)
-        features[:32] = board_np
-        
-        # Piece counts
-        features[32] = np.sum(board_np == 1) / 12.0   # black men
-        features[33] = np.sum(board_np == 2) / 12.0   # black kings
-        features[34] = np.sum(board_np == -1) / 12.0  # red men
-        features[35] = np.sum(board_np == -2) / 12.0  # red kings
-        features[36] = np.count_nonzero(board_np) / 24.0  # total pieces
-        features[37] = player                  # Current player to move
-        
-        # Simple mobility features
-        features[38] = self._calculate_mobility_feature(board_np, 1)   # Black mobility
-        features[39] = self._calculate_mobility_feature(board_np, -1)  # Red mobility
-        
+        Args:
+            boards: np.ndarray (N, 33) or list of boards
+            players: np.ndarray (N,) of players
+            
+        Returns:
+            np.ndarray (N, feature_size)
+        """
+        if isinstance(boards, list):
+            boards = np.array(boards, dtype=np.float32)
+        if isinstance(players, list):
+            players = np.array(players, dtype=np.float32)
+
+        features = self._board_to_features_fast(boards, players)
+        return features
+
+    def _board_to_features_batch_slow(self, boards, players):
+        # Fallback without numba
+        N = len(boards)
+        features = np.zeros((N, self.feature_size), dtype=np.float32)
+        # ... same as above
+        board_states = boards[:, 1:33]
+        features[:, :32] = board_states
+        # etc., copy the code above
+        features[:, 32] = np.sum(board_states == 1, axis=1) / 12.0
+        features[:, 33] = np.sum(board_states == 2, axis=1) / 12.0
+        features[:, 34] = np.sum(board_states == -1, axis=1) / 12.0
+        features[:, 35] = np.sum(board_states == -2, axis=1) / 12.0
+        features[:, 36] = np.sum(board_states != 0, axis=1) / 24.0
+        features[:, 37] = players
+        for i in range(N):
+            features[i, 38] = self._calculate_mobility_feature(board_states[i], 1)
+            features[i, 39] = self._calculate_mobility_feature(board_states[i], -1)
         return features
     
     def augment_position(self, board, player):
         """
         Create data augmentation by flipping the board horizontally.
-        This doubles the effective training data for free.
         
         Args:
             board: Original board state
             player: Current player
             
         Returns:
-            tuple: (flipped_board, flipped_player) - the horizontally flipped position
+            tuple: (flipped_board, flipped_player)
         """
         flipped_board = [0] * len(board)
         
-        # Horizontal flip mapping for checkers squares
-        # Column mapping: 0->7, 1->6, 2->5, 3->4, 4->3, 5->2, 6->1, 7->0
         flip_map = {}
         for i in range(1, 33):
             r, c = rc(i)
@@ -142,7 +219,6 @@ class NeuralEvaluator:
             if (r, flipped_c) in idx_map:
                 flip_map[i] = idx_map[(r, flipped_c)]
         
-        # Copy flipped pieces
         for i in range(1, 33):
             if i in flip_map:
                 flipped_board[flip_map[i]] = board[i]
@@ -187,19 +263,16 @@ class NeuralEvaluator:
         is_king = (np.abs(board_np) == 2).astype(np.float32)
         is_man = 1.0 - is_king
         
-        # Compute empty adjacent squares for all directions
         empty_adj = np.zeros((32, 4), dtype=np.float32)
         for d in range(4):
             mask = self.adj_matrix[:, d] != -1
-            targets = self.adj_matrix[:, d][mask]
-            empty_adj[mask, d] = (board_np[targets] == 0).astype(np.float32)
+            if np.any(mask):
+                targets = self.adj_matrix[:, d][mask]
+                empty_adj[mask, d] = (board_np[targets] == 0).astype(np.float32)
         
         total_adj = np.sum(empty_adj, axis=1)
-        
-        # Kings mobility (all directions)
         kings_mobility = np.sum(total_adj * own * is_king)
         
-        # Men mobility (forward directions only)
         if color == 1:
             man_slice = slice(0, 2)
         else:
@@ -214,91 +287,109 @@ class NeuralEvaluator:
     
     def predict(self, features):
         """
-        Forward pass through the neural network for a single feature vector.
-        
-        Args:
-            features: Input feature vector (shape (feature_size,))
-            
-        Returns:
-            Evaluation score (float), roughly in [-1000, 1000]
+        Forward pass for single input.
         """
-        # Layer 1
-        z1 = np.dot(features, self.weights['W1']) + self.weights['b1']
-        a1 = z1 * (z1 > 0)
-        
-        # Layer 2
-        z2 = np.dot(a1, self.weights['W2']) + self.weights['b2']
-        a2 = z2 * (z2 > 0)
-        
-        # Layer 3
-        z3 = np.dot(a2, self.weights['W3']) + self.weights['b3']
-        a3 = z3 * (z3 > 0)
-        
-        # Output layer
-        z4 = np.dot(a3, self.weights['W4']) + self.weights['b4']
-        output = np.tanh(z4) * 1000  # Scale to reasonable evaluation range
-        
-        return float(output[0])
+        return float(self.predict_batch(features.reshape(1, -1))[0])
     
     def _forward_batch(self, X):
-        """Forward pass for a batch. Returns intermediates for backprop."""
+        """Forward pass for a batch. Supports GPU if available."""
+        if self.has_cupy:
+            X = cp.asarray(X)
+            z1 = X @ cp.asarray(self.weights['W1']) + cp.asarray(self.weights['b1'])
+            a1 = cp.maximum(z1, 0)  # ReLU, faster than boolean
+            z2 = a1 @ cp.asarray(self.weights['W2']) + cp.asarray(self.weights['b2'])
+            a2 = cp.maximum(z2, 0)
+            z3 = a2 @ cp.asarray(self.weights['W3']) + cp.asarray(self.weights['b3'])
+            a3 = cp.maximum(z3, 0)
+            z4 = a3 @ cp.asarray(self.weights['W4']) + cp.asarray(self.weights['b4'])
+            y = cp.tanh(z4) * 1000.0
+            return [cp.asnumpy(arr) for arr in (z1, a1, z2, a2, z3, a3, z4, y)]
+        elif self.has_torch:
+            # Fallback to numpy for incomplete torch implementation to avoid dtype errors
+            return self._forward_batch_numpy(X)
+        else:
+            # Numpy
+            z1 = X @ self.weights['W1'] + self.weights['b1']
+            a1 = np.maximum(z1, 0)  # ReLU
+            z2 = a1 @ self.weights['W2'] + self.weights['b2']
+            a2 = np.maximum(z2, 0)
+            z3 = a2 @ self.weights['W3'] + self.weights['b3']
+            a3 = np.maximum(z3, 0)
+            z4 = a3 @ self.weights['W4'] + self.weights['b4']
+            y = np.tanh(z4) * 1000.0
+            return z1, a1, z2, a2, z3, a3, z4, y
+
+    def _forward_batch_numpy(self, X):
         z1 = X @ self.weights['W1'] + self.weights['b1']
-        a1 = (z1 > 0) * z1  # ReLU
+        a1 = np.maximum(z1, 0)
         z2 = a1 @ self.weights['W2'] + self.weights['b2']
-        a2 = (z2 > 0) * z2  # ReLU
+        a2 = np.maximum(z2, 0)
         z3 = a2 @ self.weights['W3'] + self.weights['b3']
-        a3 = (z3 > 0) * z3  # ReLU
+        a3 = np.maximum(z3, 0)
         z4 = a3 @ self.weights['W4'] + self.weights['b4']
         y = np.tanh(z4) * 1000.0
         return z1, a1, z2, a2, z3, a3, z4, y
-    
+
     def predict_batch(self, X):
         """Predict for a batch of features"""
-        _, _, _, _, _, _, _, y = self._forward_batch(X)
-        return y.reshape(-1)
-    
-    def train_supervised(self, positions, targets, epochs=1, batch_size=1024, lr=2e-4, l2=1e-6, shuffle=True, verbose=True):
-        """
-        Simple supervised training using MSE loss between network output and target score.
-        targets are expected in [-1, 1] (game outcome from player's perspective), and we scale by 1000.
+        if self.has_cupy:
+            _, _, _, _, _, _, _, y = self._forward_batch(cp.asarray(X))
+            return cp.asnumpy(y).reshape(-1)
+        elif self.has_torch:
+            # Simplified fallback
+            _, _, _, _, _, _, _, y = self._forward_batch(X)
+            return y.reshape(-1)
+        else:
+            _, _, _, _, _, _, _, y = self._forward_batch(X)
+            return y.reshape(-1)
 
-        Args:
-            positions: np.ndarray shape (N, feature_size)
-            targets: np.ndarray shape (N,) or (N,1) in [-1,1]
+    def batch_predict(self, boards, players):
+        """Batch evaluation from boards"""
+        features = self.board_to_features_batch(boards, players)
+        return self.predict_batch(features)
+    
+    def train_supervised(self, positions, targets, epochs=1, batch_size=1024, lr=5e-4, l2=1e-6, shuffle=True, verbose=True):
+        """
+        Simple supervised training using MSE loss.
+        Default lr=5e-4 as per task.
         """
         if positions is None or len(positions) == 0:
             return {"loss": None, "count": 0}
         
         X = positions.astype(np.float32)
-        t = targets.astype(np.float32).reshape(-1, 1) * 1000.0  # scale to [-1000, 1000]
+        t = targets.astype(np.float32).reshape(-1, 1) * 1000.0
         N = X.shape[0]
 
-        order = np.arange(N)
+        indices = np.arange(N)
+        np.random.shuffle(indices)
+        split_idx = int(0.8 * N)
+        train_indices = indices[:split_idx]
+        val_indices = indices[split_idx:]
 
         for epoch in range(epochs):
             if shuffle:
-                np.random.shuffle(order)
+                np.random.shuffle(train_indices)
             total_loss = 0.0
             total_count = 0
 
-            for start in range(0, N, batch_size):
-                idx = order[start:start+batch_size]
+            for start in range(0, len(train_indices), batch_size):
+                idx = train_indices[start:start+batch_size]
                 xb = X[idx]
                 tb = t[idx]
 
-                # Forward
+                # Forward (GPU fallback handled in _forward_batch)
                 z1, a1, z2, a2, z3, a3, z4, y = self._forward_batch(xb)
-                diff = (y - tb)
+                diff = y - tb
                 loss = float(np.mean(diff**2))
                 total_loss += loss * len(idx)
                 total_count += len(idx)
 
-                # Backprop
-                # y = 1000 * tanh(z4) => dy/dz4 = 1000 * (1 - tanh(z4)^2)
+                # Backprop (numpy for gradients, as GPU weights need sync)
+                # Assume numpy for backprop simplicity; full GPU training if needed later
                 tanh_z4 = np.tanh(z4)
                 dy_dz4 = 1000.0 * (1.0 - tanh_z4**2)
-                dL_dy = (2.0 / len(idx)) * diff  # dL/dy
-                g4 = dL_dy * dy_dz4  # dL/dz4
+                dL_dy = (2.0 / len(idx)) * diff
+                g4 = dL_dy * dy_dz4
 
                 dW4 = a3.T @ g4 + l2 * self.weights['W4']
                 db4 = np.sum(g4, axis=0)
@@ -321,48 +412,46 @@ class NeuralEvaluator:
                 dW1 = xb.T @ gz1 + l2 * self.weights['W1']
                 db1 = np.sum(gz1, axis=0)
 
-                # Adam update
                 gradients = {
                     'W4': dW4, 'b4': db4,
-                    'W3': dW3, 'b3': db3, 
+                    'W3': dW3, 'b3': db3,
                     'W2': dW2, 'b2': db2,
                     'W1': dW1, 'b1': db1
                 }
                 self._adam_update(gradients, lr)
 
-            if verbose:
-                avg_loss = total_loss / max(1, total_count)
-                print(f"[Neural Train] Epoch {epoch+1}/{epochs} - Avg MSE: {avg_loss:.4f} over {total_count} samples")
+            # Compute validation loss
+            val_loss = 0.0
+            val_count = len(val_indices)
+            if val_count > 0:
+                val_xb = X[val_indices]
+                val_tb = t[val_indices]
+                _, _, _, _, _, _, _, val_y = self._forward_batch(val_xb)
+                val_diff = val_y - val_tb
+                val_loss = float(np.mean(val_diff**2))
 
-        return {"loss": total_loss / max(1, total_count), "count": total_count}
+            avg_loss = total_loss / max(1, total_count)
+
+            if verbose:
+                print(f"[Neural Train] Epoch {epoch+1}/{epochs} - Train MSE: {avg_loss:.4f} | Val MSE: {val_loss:.4f} over {total_count} train / {val_count} val samples")
+
+        return {"train_loss": avg_loss, "val_loss": val_loss, "count": total_count}
     
     def evaluate_position(self, board, player):
         """
-        Main evaluation function that replaces the hand-crafted eval.
-        Now includes caching for improved performance.
-        
-        Args:
-            board: Board state
-            player: Player to move
-            
-        Returns:
-            Evaluation score from player's perspective (float)
+        Main evaluation function with caching.
         """
-        # Check cache first
         cache_key = self._get_position_hash(board, player)
         if cache_key in self.eval_cache:
             self.cache_hits += 1
             return self.eval_cache[cache_key]
         
-        # Cache miss - compute evaluation
         self.cache_misses += 1
         
         features = self.board_to_features(board, player)
         raw_score = self.predict(features)
-        # Return score from current player's perspective
         result = player * raw_score
         
-        # Store in cache
         self.eval_cache[cache_key] = result
         self._manage_cache_size()
         
@@ -417,6 +506,8 @@ class NeuralEvaluator:
         if isinstance(data, dict) and 'weights' in data:
             # New format with Adam state
             self.weights = data['weights']
+            for k in self.weights:
+                self.weights[k] = self.weights[k].astype(np.float32)
             self.adam_m = data.get('adam_m', {})
             self.adam_v = data.get('adam_v', {})
             self.adam_t = data.get('adam_t', 0)
@@ -427,6 +518,8 @@ class NeuralEvaluator:
         else:
             # Old format - just weights
             self.weights = data
+            for k in self.weights:
+                self.weights[k] = self.weights[k].astype(np.float32)
             self._init_adam_state()
             
         print(f"Neural model loaded from: {filepath}")
@@ -460,28 +553,23 @@ class TrainingDataCollector:
     def __init__(self, use_augmentation=True):
         self.positions = []
         self.scores = []
-        self.use_augmentation = use_augmentation
+        self.use_augmentation = use_augmentation  # But will use 50% freq
     
     def add_position(self, board, player, game_result):
         """
-        Add a position with its eventual game outcome.
-        
-        Args:
-            board: Board state
-            player: Player to move
-            game_result: Final game result (1.0 for black win, -1.0 for red win, 0.0 for draw)
+        Add a position with 50% chance of augmentation.
         """
         evaluator = get_neural_evaluator()
         
-        # Original position
+        # Original
         features = evaluator.board_to_features(board, player)
-        score = player * game_result  # Score from current player's perspective in [-1, 0, 1]
+        score = player * game_result
         
         self.positions.append(features)
         self.scores.append(score)
         
-        # Add augmented position if enabled
-        if self.use_augmentation:
+        # 50% augmentation
+        if self.use_augmentation and random.random() < 0.5:
             flipped_board, flipped_player = evaluator.augment_position(board, player)
             flipped_features = evaluator.board_to_features(flipped_board, flipped_player)
             flipped_score = flipped_player * game_result
@@ -490,14 +578,22 @@ class TrainingDataCollector:
             self.scores.append(flipped_score)
     
     def save_training_data(self, filepath):
-        """Save collected training data"""
-        data = {
-            'positions': np.array(self.positions, dtype=np.float32),
-            'scores': np.array(self.scores, dtype=np.float32)
-        }
-        with open(filepath, 'wb') as f:
-            pickle.dump(data, f)
-        print(f"Saved {len(self.positions)} training positions to {filepath}")
+        """Save to npz compressed format"""
+        if filepath.endswith('.pkl'):
+            filepath = filepath.replace('.pkl', '.npz')
+        positions_np = np.array(self.positions, dtype=np.float32)
+        scores_np = np.array(self.scores, dtype=np.float32)
+        np.savez_compressed(filepath, positions=positions_np, scores=scores_np)
+        print(f"Saved {len(self.positions)} positions to {filepath}")
+    
+    def load_training_data(self, filepath):
+        """Load from npz only"""
+        if not filepath.endswith('.npz'):
+            raise ValueError(f"Only .npz format supported: {filepath}")
+        data = np.load(filepath, allow_pickle=False)
+        self.positions = list(data['positions'])
+        self.scores = list(data['scores'])
+        print(f"Loaded {len(self.positions)} positions from {filepath}")
     
     def clear(self):
         """Clear collected data"""
@@ -508,19 +604,15 @@ class TrainingDataCollector:
 # Integration function
 def integrate_neural_evaluation():
     """
-    Call this function to replace the hand-crafted evaluation with neural network.
-    You would modify your main game file to call this during initialization.
+    Integrate optimized neural evaluation.
     """
     try:
-        import gameotherother  # Your main game module
-        
-        # Replace the evaluation function
+        import gameotherother
         gameotherother.evaluate = evaluate_neural
-        
-        print("Neural network evaluation activated (module-level)!")
+        print("Optimized neural evaluation activated!")
         return True
     except ImportError:
-        print("Could not import gameotherother module")
+        print("Could not integrate neural evaluation")
         return False
 
 

@@ -9,6 +9,8 @@ import random
 from copy import deepcopy
 from collections import deque
 import os
+import multiprocessing as mp
+from multiprocessing import Pool, Manager
 
 # Import the neural evaluator from the previous implementation
 from neural_eval import NeuralEvaluator, TrainingDataCollector, get_neural_evaluator
@@ -30,8 +32,15 @@ class SelfPlayTrainer:
             'red_wins': 0,
             'draws': 0,
             'avg_game_length': 0,
-            'positions_collected': 0
+            'positions_collected': 0,
+            'random_moves_total': 0,  # Total random moves across all games
+            'random_moves_per_game': []  # Random moves per game for tracking
         }
+        # Epsilon schedule parameters
+        self.epsilon_start = 0.10  # 10% initial exploration
+        self.epsilon_end = 0.01    # 1% final exploration
+        self.epsilon_decay_games = 100  # Decay over 100 games by default
+        self.current_epsilon = self.epsilon_start  # Current epsilon value
         
         # Load previous training progress if specified
         if resume_from_checkpoint:
@@ -61,47 +70,35 @@ class SelfPlayTrainer:
                 opponent.weights[layer] += noise * mask
                 
         return opponent
-    
-    def play_self_play_game(self, max_moves=200, noise_temp=0.1):
-        """
-        Play a complete self-play game and collect training positions.
-        
-        Returns:
-            tuple: (game_result, positions_collected, move_count)
-        """
+
+    def _play_single_game(self, game_num, epsilon, base_evaluator, opponent_evaluator, shared_tt):
         from gameotherother import initial_board, legal_moves, apply_move, is_terminal, SearchEngine
-        
-        # Create two evaluators: base vs slightly mutated opponent
-        evaluator1 = self.base_evaluator
-        evaluator2 = self.create_opponent_evaluator()
-        
-        # Create search engines for both players and attach evaluators
-        engine1 = SearchEngine(seed=random.randint(0, 10000))
-        engine2 = SearchEngine(seed=random.randint(0, 10000))
+        evaluator1 = base_evaluator
+        evaluator2 = opponent_evaluator
+        engine1 = SearchEngine(seed=random.randint(0, 10000), shared_tt=shared_tt)
+        engine2 = SearchEngine(seed=random.randint(0, 10000), shared_tt=shared_tt)
         engine1.neural_evaluator = evaluator1
         engine2.neural_evaluator = evaluator2
-        
         board = initial_board()
         player = 1  # Black starts
         move_count = 0
+        random_moves_count = 0  # Track random moves in this game
         game_positions = []  # Store positions for this game
-        
-        while move_count < max_moves:
+        game_start = time.time()
+        while move_count < 200:
             if is_terminal(board, player):
                 break
-                
             # Store position before move
             game_positions.append((board[:], player))
-            
             # Choose engine based on player
             current_engine = engine1 if player == 1 else engine2
-            
-            # Exploration: 5% random move, otherwise search
+            # Exploration: use current epsilon for random move probability
             depth = random.choice([4, 5, 6])  # Vary search depth
             try:
-                if random.random() < 0.05:
+                if random.random() < epsilon:
                     moves = legal_moves(board, player)
                     best_move = random.choice(moves) if moves else None
+                    random_moves_count += 1  # Increment random moves counter
                     _ = 0
                 else:
                     _, best_move = current_engine.search(board, player, depth)
@@ -109,15 +106,13 @@ class SelfPlayTrainer:
                 # Fallback to random legal move if search fails
                 moves = legal_moves(board, player)
                 best_move = random.choice(moves) if moves else None
-            
+                random_moves_count += 1  # Count fallback as random move
             if best_move is None:
                 break
-                
             # Apply move
             board = apply_move(board, best_move)
             player = -player
             move_count += 1
-        
         # Determine game result
         if is_terminal(board, player):
             # Current player to move has no legal moves - they lose
@@ -125,35 +120,17 @@ class SelfPlayTrainer:
         else:
             # Draw (max moves reached)
             game_result = 0
-        
         # Convert game result to training targets
+        game_positions_list = []
         for board_state, pos_player in game_positions:
             if game_result == 0:
                 target_score = 0.0  # Draw
             else:
                 target_score = 1.0 if pos_player == game_result else -1.0
-            
-            self.training_data.add_position(board_state, pos_player, target_score)
-        
-        # Update stats
-        if game_result == 1:
-            self.training_stats['black_wins'] += 1
-        elif game_result == -1:
-            self.training_stats['red_wins'] += 1
-        else:
-            self.training_stats['draws'] += 1
-            
-        self.games_played += 1
-        positions_in_game = len(game_positions)
-        self.total_positions += positions_in_game
-        self.training_stats['positions_collected'] = self.total_positions
-        
-        # Update average game length
-        total_games = self.training_stats['black_wins'] + self.training_stats['red_wins'] + self.training_stats['draws']
-        if total_games > 0:
-            self.training_stats['avg_game_length'] = ((self.training_stats['avg_game_length'] * (total_games - 1)) + move_count) / total_games
-        
-        return game_result, positions_in_game, move_count
+            game_positions_list.append((board_state, pos_player, target_score))
+        game_time = time.time() - game_start
+        return game_result, len(game_positions), move_count, random_moves_count, game_positions_list, game_time
+    
     
     def train_on_collected_data(self, epochs=2, batch_size=1024, lr=5e-4, l2=1e-6):
         """Perform a simple supervised training pass on the collected data."""
@@ -169,11 +146,11 @@ class SelfPlayTrainer:
         )
         return stats
     
-    def run_training_session(self, num_games=100, save_interval=10,
-                           model_save_path="neural_model.pkl",
-                           data_save_path="training_data.pkl",
-                           checkpoint_path="training_checkpoint.pkl",
-                           progress_callback=None):
+    def run_training_session(self, num_games=100, save_interval=10, num_workers=4,
+                             model_save_path="neural_model.pkl",
+                             data_save_path="training_data.pkl",
+                             checkpoint_path="training_checkpoint.pkl",
+                             progress_callback=None):
         """
         Run a complete self-play training session.
         """
@@ -185,34 +162,66 @@ class SelfPlayTrainer:
         
         start_time = time.time()
         
-        for game_num in range(num_games):
-            game_start = time.time()
-            result, positions, moves = self.play_self_play_game()
-            game_time = time.time() - game_start
-            
-            # Print progress
-            if (game_num + 1) % 5 == 0 or game_num == 0:
-                result_str = "Black wins" if result == 1 else "Red wins" if result == -1 else "Draw"
-                print(f"Game {game_num + 1:3d}: {result_str:10s} | "
-                      f"Moves: {moves:3d} | Positions: {positions:3d} | "
-                      f"Time: {game_time:.2f}s")
-            
-            # Report progress
-            if progress_callback:
-                progress_callback(game_num + 1, num_games)
-            
-            # Save progress and train periodically
-            if (game_num + 1) % save_interval == 0:
-                # Train on the data collected so far
-                stats = self.train_on_collected_data(epochs=2, batch_size=1024, lr=5e-4, l2=1e-6)
-                if stats and stats.get("loss") is not None:
-                    print(f"Post-chunk training: MSE {stats['loss']:.4f} on {stats['count']} samples")
-                # Save progress
-                self.save_training_progress(model_save_path, data_save_path, checkpoint_path)
-                self.print_training_stats()
-                print("-" * 60)
-                # Optionally clear data to avoid overfitting on same samples repeatedly
-                self.training_data.clear()
+        if num_workers == 1:
+            shared_tt = None
+            for game_num in range(num_games):
+                # Update epsilon based on current game number (linear decay)
+                progress = min(1.0, (game_num) / max(1, self.epsilon_decay_games))
+                self.current_epsilon = self.epsilon_start - (self.epsilon_start - self.epsilon_end) * progress
+                
+                opponent = self.create_opponent_evaluator()
+                result, positions, moves, random_moves, game_positions_list, game_time = self._play_single_game(game_num, self.current_epsilon, self.base_evaluator, opponent, shared_tt)
+                
+                # Update exploration tracking stats
+                self.training_stats['random_moves_total'] += random_moves
+                self.training_stats['random_moves_per_game'].append(random_moves)
+                
+                if result == 1:
+                    self.training_stats['black_wins'] += 1
+                elif result == -1:
+                    self.training_stats['red_wins'] += 1
+                else:
+                    self.training_stats['draws'] += 1
+                
+                self.games_played += 1
+                self.total_positions += positions
+                self.training_stats['positions_collected'] = self.total_positions
+                
+                total_games = self.training_stats['black_wins'] + self.training_stats['red_wins'] + self.training_stats['draws']
+                if total_games > 0:
+                    self.training_stats['avg_game_length'] = ((self.training_stats['avg_game_length'] * (total_games - 1)) + moves) / total_games
+                
+                for board_state, pos_player, target_score in game_positions_list:
+                    self.training_data.add_position(board_state, pos_player, target_score)
+                
+                # Print progress with exploration metrics
+                if (game_num + 1) % 5 == 0 or game_num == 0:
+                    result_str = "Black wins" if result == 1 else "Red wins" if result == -1 else "Draw"
+                    avg_random_moves = sum(self.training_stats['random_moves_per_game'][-5:]) / min(5, len(self.training_stats['random_moves_per_game']))
+                    print(f"Game {game_num + 1:3d}: {result_str:10s} | "
+                          f"Moves: {moves:3d} | Positions: {positions:3d} | "
+                          f"Random: {random_moves:2d} (ε={self.current_epsilon:.3f}) | "
+                          f"Time: {game_time:.2f}s")
+                
+                # Report progress
+                if progress_callback:
+                    progress_callback(game_num + 1, num_games)
+                
+                # Save progress and train periodically
+                if (game_num + 1) % save_interval == 0:
+                    # Train on the data collected so far
+                    stats = self.train_on_collected_data(epochs=2, batch_size=1024, lr=5e-4, l2=1e-6)
+                    if stats and stats.get("loss") is not None:
+                        print(f"Post-chunk training: MSE {stats['loss']:.4f} on {stats['count']} samples")
+                    # Save progress
+                    self.save_training_progress(model_save_path, data_save_path, checkpoint_path)
+                    self.print_training_stats()
+                    print("-" * 60)
+                    # Optionally clear data to avoid overfitting on same samples repeatedly
+                    self.training_data.clear()
+        else:
+            runner = ParallelGameRunner(self, num_workers)
+            runner.run_games(num_games, save_interval, model_save_path, data_save_path, checkpoint_path, progress_callback)
         
         # Final report
         if progress_callback:
@@ -240,8 +249,6 @@ class SelfPlayTrainer:
             'games_played': self.games_played,
             'total_positions': self.total_positions,
             'training_stats': self.training_stats,
-            'collected_positions': np.array(self.training_data.positions) if self.training_data.positions else np.array([]),
-            'collected_scores': np.array(self.training_data.scores) if self.training_data.scores else np.array([]),
             'model_weights': self.base_evaluator.weights,
             'adam_state': {
                 'adam_m': self.base_evaluator.adam_m,
@@ -275,11 +282,11 @@ class SelfPlayTrainer:
             })
             
             # Restore collected training data
-            positions = checkpoint_data.get('collected_positions', np.array([]))
-            scores = checkpoint_data.get('collected_scores', np.array([]))
-            if len(positions) > 0:
-                self.training_data.positions = positions.tolist()
-                self.training_data.scores = scores.tolist()
+            data_path = "training_data.npz"
+            if os.path.exists(data_path):
+                self.training_data.load_training_data(data_path)
+            else:
+                print(f"Warning: Training data {data_path} not found, starting empty.")
             
             # Restore model state
             if 'model_weights' in checkpoint_data:
@@ -308,12 +315,8 @@ class SelfPlayTrainer:
         print(f"Model saved to: {model_save_path}")
         
         # Save training data (positions and scores)
-        data_to_save = {
-            'positions': self.training_data.positions,
-            'scores': self.training_data.scores
-        }
-        with open(data_save_path, 'wb') as f:
-            pickle.dump(data_to_save, f)
+        data_save_path = data_save_path.rsplit('.', 1)[0] + '.npz'
+        np.savez_compressed(data_save_path, positions=np.array(self.training_data.positions), scores=np.array(self.training_data.scores), allow_pickle=False)
         print(f"Training data saved to: {data_save_path}")
         
         # Save checkpoint (stats, partial data, model state)
@@ -334,6 +337,11 @@ class SelfPlayTrainer:
         print(f"  Draws: {self.training_stats['draws']} ({100*self.training_stats['draws']/total_games:.1f}%)")
         print(f"  Average game length: {self.training_stats['avg_game_length']:.1f} moves")
         print(f"  Total positions collected: {self.training_stats['positions_collected']}")
+        if total_games > 0:
+            avg_random_per_game = self.training_stats['random_moves_total'] / total_games
+            print(f"  Total random moves: {self.training_stats['random_moves_total']}")
+            print(f"  Average random moves per game: {avg_random_per_game:.1f}")
+            print(f"  Current epsilon: {self.current_epsilon:.3f}")
 
 
 class TrainingUI:
@@ -544,6 +552,132 @@ def _training_error(self, error_msg):
 '''
     
     return training_button_code
+
+
+def _play_single_game_worker(args):
+    game_num, epsilon, base_evaluator, opponent_evaluator, shared_tt = args
+    evaluator1 = deepcopy(base_evaluator)
+    evaluator2 = deepcopy(opponent_evaluator)
+    from gameotherother import initial_board, legal_moves, apply_move, is_terminal, SearchEngine
+    engine1 = SearchEngine(seed=random.randint(0, 10000), shared_tt=shared_tt)
+    engine2 = SearchEngine(seed=random.randint(0, 10000), shared_tt=shared_tt)
+    engine1.neural_evaluator = evaluator1
+    engine2.neural_evaluator = evaluator2
+    board = initial_board()
+    player = 1  # Black starts
+    move_count = 0
+    random_moves_count = 0  # Track random moves in this game
+    game_positions = []  # Store positions for this game
+    game_start = time.time()
+    while move_count < 200:
+        if is_terminal(board, player):
+            break
+        # Store position before move
+        game_positions.append((board[:], player))
+        # Choose engine based on player
+        current_engine = engine1 if player == 1 else engine2
+        # Exploration: use current epsilon for random move probability
+        depth = random.choice([4, 5, 6])  # Vary search depth
+        try:
+            if random.random() < epsilon:
+                moves = legal_moves(board, player)
+                best_move = random.choice(moves) if moves else None
+                random_moves_count += 1  # Increment random moves counter
+                _ = 0
+            else:
+                _, best_move = current_engine.search(board, player, depth)
+        except Exception:
+            # Fallback to random legal move if search fails
+            moves = legal_moves(board, player)
+            best_move = random.choice(moves) if moves else None
+            random_moves_count += 1  # Count fallback as random move
+        if best_move is None:
+            break
+        # Apply move
+        board = apply_move(board, best_move)
+        player = -player
+        move_count += 1
+    # Determine game result
+    if is_terminal(board, player):
+        # Current player to move has no legal moves - they lose
+        game_result = -player  # Winner is the opposite player
+    else:
+        # Draw (max moves reached)
+        game_result = 0
+    # Convert game result to training targets
+    game_positions_list = []
+    for board_state, pos_player in game_positions:
+        if game_result == 0:
+            target_score = 0.0  # Draw
+        else:
+            target_score = 1.0 if pos_player == game_result else -1.0
+        game_positions_list.append((board_state, pos_player, target_score))
+    game_time = time.time() - game_start
+    return game_result, len(game_positions), move_count, random_moves_count, game_positions_list, game_time
+
+
+class ParallelGameRunner:
+    def __init__(self, trainer, num_workers=4):
+        self.trainer = trainer
+        self.num_workers = num_workers
+        self.shared_tt = Manager().dict()
+        try:
+            mp.set_start_method('spawn', force=True)
+        except RuntimeError:
+            pass
+        self.pool = Pool(self.num_workers)
+
+    def run_games(self, num_games, save_interval, model_save_path, data_save_path, checkpoint_path, progress_callback=None):
+        batch_size = self.num_workers * 5
+        for start in range(0, num_games, batch_size):
+            end = min(start + batch_size, num_games)
+            batch_params = []
+            for game_num in range(start, end):
+                progress = min(1.0, game_num / max(1, self.trainer.epsilon_decay_games))
+                epsilon = self.trainer.epsilon_start - (self.trainer.epsilon_start - self.trainer.epsilon_end) * progress
+                opponent = self.trainer.create_opponent_evaluator()
+                batch_params.append((game_num, epsilon, self.trainer.base_evaluator, opponent, self.shared_tt))
+            batch_results = self.pool.starmap(_play_single_game_worker, batch_params)
+            for i, res in enumerate(batch_results):
+                game_num = start + i
+                result, positions, moves, random_moves, game_positions_list, game_time = res
+                self.trainer.training_stats['random_moves_total'] += random_moves
+                self.trainer.training_stats['random_moves_per_game'].append(random_moves)
+                if result == 1:
+                    self.trainer.training_stats['black_wins'] += 1
+                elif result == -1:
+                    self.trainer.training_stats['red_wins'] += 1
+                else:
+                    self.trainer.training_stats['draws'] += 1
+                self.trainer.games_played += 1
+                self.trainer.total_positions += positions
+                self.trainer.training_stats['positions_collected'] = self.trainer.total_positions
+                total_games = self.trainer.training_stats['black_wins'] + self.trainer.training_stats['red_wins'] + self.trainer.training_stats['draws']
+                if total_games > 0:
+                    self.trainer.training_stats['avg_game_length'] = ((self.trainer.training_stats['avg_game_length'] * (total_games - 1)) + moves) / total_games
+                for board_state, pos_player, target_score in game_positions_list:
+                    self.trainer.training_data.add_position(board_state, pos_player, target_score)
+                progress = min(1.0, game_num / max(1, self.trainer.epsilon_decay_games))
+                epsilon_print = self.trainer.epsilon_start - (self.trainer.epsilon_start - self.trainer.epsilon_end) * progress
+                if (game_num + 1) % 5 == 0 or game_num == 0:
+                    result_str = "Black wins" if result == 1 else "Red wins" if result == -1 else "Draw"
+                    avg_random_moves = sum(self.trainer.training_stats['random_moves_per_game'][-5:]) / min(5, len(self.trainer.training_stats['random_moves_per_game']))
+                    print(f"Game {game_num + 1:3d}: {result_str:10s} | "
+                          f"Moves: {moves:3d} | Positions: {positions:3d} | "
+                          f"Random: {random_moves:2d} (ε={epsilon_print:.3f}) | "
+                          f"Time: {game_time:.2f}s")
+                if progress_callback:
+                    progress_callback(game_num + 1, num_games)
+                if (game_num + 1) % save_interval == 0:
+                    stats = self.trainer.train_on_collected_data(epochs=2, batch_size=1024, lr=5e-4, l2=1e-6)
+                    if stats and stats.get("loss") is not None:
+                        print(f"Post-chunk training: MSE {stats['loss']:.4f} on {stats['count']} samples")
+                    self.trainer.save_training_progress(model_save_path, data_save_path, checkpoint_path)
+                    self.trainer.print_training_stats()
+                    print("-" * 60)
+                    self.trainer.training_data.clear()
+        self.pool.close()
+        self.pool.join()
 
 
 if __name__ == "__main__":

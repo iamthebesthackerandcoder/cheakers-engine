@@ -12,6 +12,18 @@ import re
 import time
 import os
 import random
+from typing import Optional
+
+import numpy as np
+try:
+    from neural_eval import NeuralEvaluator
+except ImportError:
+    # Fallback if neural_eval is not available
+    class _NeuralEvaluator:
+        """Dummy NeuralEvaluator for type checking"""
+        def evaluate_position(self, board, player):
+            return 0
+    NeuralEvaluator = _NeuralEvaluator  # Alias for compatibility
 
 # ------------- Configuration -------------
 
@@ -37,7 +49,7 @@ if not sys.stdout.isatty():
 
 SQUARES = 32
 
-rc_of = [None] * (SQUARES + 1)
+rc_of: list[tuple[int, int]] = [(-1, -1)] * (SQUARES + 1)  # Initialize with dummy values
 idx_map = {}
 
 def build_mappings():
@@ -48,10 +60,12 @@ def build_mappings():
                 rc_of[i] = (r, c)
                 idx_map[(r, c)] = i
                 i += 1
+    # Set index 0 to a dummy value (not a valid square)
+    rc_of[0] = (-1, -1)
 
 build_mappings()
 
-def rc(i):
+def rc(i) -> tuple[int, int]:
     return rc_of[i]
 
 # Direction indices: 0: NW(-1,-1), 1: NE(-1, 1), 2: SW(1,-1), 3: SE(1,1)
@@ -142,7 +156,7 @@ def jumps_from(b, pos):
             # All directions tried, check if leaf
             stack.pop()
             if len(seq) > 1:
-                results.append(seq[seq_start:])  # copy relevant seq
+                results.append(seq[:])  # full sequence copy
             # Backtrack changes from changed_start
             for i in range(len(changed) - 1, changed_start - 1, -1):
                 idx, old_val = changed[i]
@@ -192,6 +206,7 @@ def legal_moves(b, player):
             js = jumps_from(b, pos)
             if js:
                 all_jumps.extend(js)
+    all_jumps = [m for m in all_jumps if len(m) >= 2 and b[m[0]] * player > 0]
     if CAPTURES_MANDATORY:
         if all_jumps:
             return all_jumps
@@ -364,28 +379,37 @@ def piece_index(v):
     raise ValueError("Invalid piece for hashing")
 
 class SearchEngine:
-    def __init__(self, seed=2025):
+    def __init__(self, seed=2025, shared_tt=None, batch_size=32):
         self.rand = random.Random(seed)
+        self.batch_size = batch_size
         # Zobrist keys
         self.z_piece = [[self.rand.getrandbits(64) for _ in range(4)] for _ in range(SQUARES + 1)]
         self.z_side = self.rand.getrandbits(64)
-        self.tt = collections.OrderedDict()  # hash -> (depth, value, flag, best_move)
-        self.tt_max_size = 1 << 20  # 1M entries
+        if shared_tt is not None:
+            self.tt = shared_tt  # Use shared dict, no ordering
+            self.is_shared_tt = True
+            self.tt_max_size = 100000
+        else:
+            self.tt = collections.OrderedDict()
+            self.is_shared_tt = False
+            self.tt_max_size = 100000
         self.max_ply = 0
         self.nodes = 0
         self.killers = []  # [ [m1, m2], ... ]
         # history[(side, frm, to)] = score
         self.history = {}
-        self.board = None
+        self.board: list[int] = []  # Initialize as empty list, will be set in reset_search
         self.hash = 0
         self.side = 1
         self.root_best_move = None
         self.total_pieces = 0
         self.move_cache = collections.OrderedDict()
+        self.tt_hits = 0
+        self.tt_misses = 0
+        self.leaf_buffer = []
 
-        # Optional neural evaluator: if set (object with evaluate_position(board, player)),
-        # the engine will use it instead of the built-in evaluate().
-        self.neural_evaluator = None
+        # Optional neural evaluator
+        self.neural_evaluator: Optional[NeuralEvaluator] = None
 
     def compute_hash(self, b, side):
         h = 0
@@ -397,6 +421,9 @@ class SearchEngine:
             h ^= self.z_side
         return h
 
+    def _get_tt_key(self, board, side):
+        return hash(tuple(board) + (side,))
+
     def reset_search(self, b, side, depth):
         self.board = b.copy()
         self.side = side
@@ -405,17 +432,34 @@ class SearchEngine:
         self.max_ply = depth + 64
         self.killers = [[None, None] for _ in range(self.max_ply)]
         self.total_pieces = sum(1 for x in self.board[1:] if x != 0)
-        # Keep TT and history across moves for better performance
+        self.tt_hits = 0
+        self.tt_misses = 0
+        self.leaf_buffer = []
+        # Keep TT and history across moves
+        # If shared TT, no clear needed as shared
+        if not self.is_shared_tt:
+            # For local, could clear if desired, but keep for now
+            pass
 
     def _eval(self, b, side):
-        """Internal evaluation shim: use neural evaluator if provided, else fallback."""
+        """Internal evaluation using batch_predict if available for consistency."""
         if self.neural_evaluator is not None:
             try:
-                return int(self.neural_evaluator.evaluate_position(b, side))
+                return int(self.neural_evaluator.batch_predict(np.array([b]), np.array([side]))[0])
             except Exception:
-                # Fall back to built-in if something goes wrong
                 pass
         return evaluate(b, side)
+    
+    def batch_eval(self, boards, sides):
+        """Batch evaluation for multiple positions, if neural evaluator supports it."""
+        if self.neural_evaluator is not None and hasattr(self.neural_evaluator, 'batch_predict'):
+            try:
+                scores = self.neural_evaluator.batch_predict(boards, sides)
+                return [int(s) for s in scores]
+            except Exception:
+                pass
+        # Fallback to individual evals
+        return [self._eval(b, s) for b, s in zip(boards, sides)]
 
     def do_move(self, seq):
         # Apply seq in-place, return undo info
@@ -512,7 +556,7 @@ class SearchEngine:
                 js = jumps_from(self.board, pos)
                 if js:
                     res.extend(js)
-        return res
+        return [m for m in res if len(m) >= 2 and self.board[m[0]] * side > 0]
 
     def quiescence(self, alpha, beta, ply):
         self.nodes += 1
@@ -524,6 +568,7 @@ class SearchEngine:
 
         # Only consider capture sequences for quiescence
         moves = self.gen_captures_only(self.side)
+        moves = [m for m in moves if len(m) >= 2 and self.board[m[0]] * self.side > 0]
         if not moves:
             return stand_pat
 
@@ -571,12 +616,21 @@ class SearchEngine:
         self.nodes += 1
 
         # TT probe
-        entry = self.tt.get(self.hash)
+        tt_key = self._get_tt_key(self.board, self.side) if self.is_shared_tt else self.hash
+        entry = self.tt.get(tt_key)
+        if entry is not None:
+            self.tt_hits += 1
+        else:
+            self.tt_misses += 1
         tt_move = None
         if entry is not None:
-            tt_depth, tt_value, tt_flag, tt_best = entry
-            if tt_best is not None:
-                tt_move = tt_best
+            if self.is_shared_tt:
+                tt_depth, tt_value, tt_flag = entry
+                tt_best = None
+            else:
+                tt_depth, tt_value, tt_flag, tt_best = entry
+                if tt_best is not None:
+                    tt_move = tt_best
             if tt_depth >= depth:
                 if tt_flag == "EXACT":
                     return tt_value
@@ -586,8 +640,12 @@ class SearchEngine:
                     beta = tt_value
                 if alpha >= beta:
                     return tt_value
-            # Move to end for LRU
-            self.tt.move_to_end(self.hash)
+            # LRU only if not shared
+            if not self.is_shared_tt:
+                if hasattr(self.tt, 'move_to_end'):
+                    self.tt.move_to_end(self.hash)
+        else:
+            self.tt_misses += 1
 
         # Null-move pruning
         if depth >= 3 and self.total_pieces > 10:
@@ -598,14 +656,28 @@ class SearchEngine:
             self.hash ^= self.z_side
             if null_score >= beta:
                 # Store cutoff in TT
-                self.tt.move_to_end(self.hash)
-                self.tt[self.hash] = (depth, beta, "LOWER", None)
-                if len(self.tt) > self.tt_max_size:
-                    self.tt.popitem(last=False)
+                tt_key = self._get_tt_key(self.board, self.side) if self.is_shared_tt else self.hash
+                if self.is_shared_tt:
+                    self.tt[tt_key] = (depth, beta, "LOWER")
+                else:
+                    self.tt[tt_key] = (depth, beta, "LOWER", None)
+                self._limit_tt_size()
                 return beta
 
         if depth == 0:
-            return self.quiescence(alpha, beta, ply)
+            self.leaf_buffer.append((self.board.copy(), self.side))
+            if len(self.leaf_buffer) < 2:
+                print("Fallback to single eval")
+                return self.quiescence(alpha, beta, ply)
+            else:
+                batch_size_actual = min(self.batch_size, len(self.leaf_buffer))
+                batch_boards = [p[0] for p in self.leaf_buffer[-batch_size_actual:]]
+                batch_sides = [p[1] for p in self.leaf_buffer[-batch_size_actual:]]
+                batch_values = self.batch_eval(np.array(batch_boards), np.array(batch_sides))
+                score = batch_values[-1]  # for current leaf
+                del self.leaf_buffer[-batch_size_actual:]
+                print(f"Used batch size {batch_size_actual}")
+                return score
 
         moves = self.gen_moves(self.side)
         if not moves:
@@ -655,19 +727,35 @@ class SearchEngine:
                     frm = m[0]; to = m[-1]
                     self.history[(self.side, frm, to)] = self.history.get((self.side, frm, to), 0) + depth * depth
                 # TT store as lower bound (beta cutoff)
-                self.tt.move_to_end(self.hash)
-                self.tt[self.hash] = (depth, best_val, "LOWER", best_move)
-                if len(self.tt) > self.tt_max_size:
-                    self.tt.popitem(last=False)
+                tt_key = self._get_tt_key(self.board, self.side) if self.is_shared_tt else self.hash
+                if self.is_shared_tt:
+                    self.tt[tt_key] = (depth, best_val, "LOWER")
+                else:
+                    self.tt[tt_key] = (depth, best_val, "LOWER", best_move)
+                self._limit_tt_size()
                 return best_val
 
         # Store in TT
+        tt_key = self._get_tt_key(self.board, self.side) if self.is_shared_tt else self.hash
         flag = "EXACT" if best_val > orig_alpha and best_val < beta else ("UPPER" if best_val <= orig_alpha else "LOWER")
-        self.tt.move_to_end(self.hash)
-        self.tt[self.hash] = (depth, best_val, flag, best_move)
-        if len(self.tt) > self.tt_max_size:
-            self.tt.popitem(last=False)
+        if self.is_shared_tt:
+            self.tt[tt_key] = (depth, best_val, flag)
+        else:
+            self.tt[tt_key] = (depth, best_val, flag, best_move)
+        self._limit_tt_size()
         return best_val
+
+    def _limit_tt_size(self):
+        """Limit TT size, handle shared vs local."""
+        if len(self.tt) > self.tt_max_size:
+            if self.is_shared_tt:
+                # Simple: remove oldest by key (assume keys are hashes, remove first few)
+                keys = list(self.tt.keys())
+                for _ in range(len(keys) // 4):  # Remove 25%
+                    if keys:
+                        del self.tt[keys.pop(0)]
+            else:
+                self.tt.popitem(last=False)
 
     def search(self, b, player, depth):
         self.reset_search(b, player, depth)
@@ -690,14 +778,19 @@ class SearchEngine:
                 # Fallback: pick any legal move if needed
                 ms = self.gen_moves(self.side)
                 self.root_best_move = ms[0] if ms else None
+        hit_rate = self.tt_hits / max(1, self.tt_hits + self.tt_misses) * 100 if self.tt_hits + self.tt_misses > 0 else 0
+        print(f"Search completed: TT hits {self.tt_hits}/{self.tt_hits + self.tt_misses} ({hit_rate:.1f}%), TT size {len(self.tt)}")
         return int(best_val), self.root_best_move
 
-# Backwards-compatible wrapper (keeps original signature)
+# Backwards-compatible wrapper
 _ENGINE_SINGLETON = None
-def get_engine():
+def get_engine(shared_tt=None):
     global _ENGINE_SINGLETON
     if _ENGINE_SINGLETON is None:
-        _ENGINE_SINGLETON = SearchEngine()
+        _ENGINE_SINGLETON = SearchEngine(shared_tt=shared_tt)
+    else:
+        # If already created, can't change shared_tt easily
+        pass
     return _ENGINE_SINGLETON
 
 def minimax(b, depth, alpha, beta, player):
@@ -1184,7 +1277,7 @@ Type '{style_text('help', Colors.ACCENT)}' for commands or start playing!
                     
                 if cmd == "pick":
                     k = arg
-                    if 1 <= k <= len(moves):
+                    if isinstance(k, int) and 1 <= k <= len(moves):
                         mv = moves[k - 1]
                         history.append((b.copy(), player, move_num, last_move))
                         b = apply_move(b, mv)

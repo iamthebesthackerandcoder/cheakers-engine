@@ -1,12 +1,3 @@
-# checkers_gui_tk.py
-# A friendly Tkinter GUI for gameotherother.py
-# Place this file next to gameotherother.py and run:
-#   python checkers_gui_tk.py
-#
-# Updated to support:
-# - Optional neural evaluation (toggle)
-# - "Train AI" button running self-play training in background
-
 import threading
 import time
 import tkinter as tk
