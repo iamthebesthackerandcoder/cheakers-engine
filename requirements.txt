@@ -1,4 +1,5 @@
 numpy>=1.26
+pydantic>=2.0
 
 # Optional acceleration / extras (install as needed)
 # numba>=0.59
