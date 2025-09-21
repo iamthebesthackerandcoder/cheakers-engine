@@ -19,7 +19,7 @@ def test_position_scorer():
 
     # Test initial position
     score = scorer.score_position(board, player, 'opening')
-    print(".3f")
+    print(f"Initial position score: {score:.3f}")
 
     # Test mid-game position (remove some pieces)
     mid_board = board.copy()
@@ -27,7 +27,7 @@ def test_position_scorer():
     mid_board[5] = 0  # Remove black piece
     mid_board[28] = 0  # Remove red piece
     score_mid = scorer.score_position(mid_board, player, 'middlegame')
-    print(".3f")
+    print(f"Mid-game position score: {score_mid:.3f}")
 
     # Test endgame position
     end_board = board.copy()
@@ -37,7 +37,7 @@ def test_position_scorer():
     end_board[1] = 1  # Keep one black piece
     end_board[32] = -1  # Keep one red piece
     score_end = scorer.score_position(end_board, player, 'endgame')
-    print(".3f")
+    print(f"Endgame position score: {score_end:.3f}")
 
     print("✅ Position scoring working correctly\n")
 
@@ -191,7 +191,7 @@ def test_data_collection():
     print(f"Position scores after: {len(trainer.position_scores)}")
 
     if trainer.position_scores:
-        print(".3f")
+        print(f"Latest position score: {trainer.position_scores[-1]:.3f}")
 
     print("✅ Data collection working correctly\n")
 

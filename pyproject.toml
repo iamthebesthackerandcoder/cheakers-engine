@@ -1,0 +1,44 @@
+[project]
+name = "checkers-ai"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.black]
+line-length = 100
+target-version = ["py313"]
+
+[tool.ruff]
+line-length = 100
+src = ["."]
+exclude = [
+  ".git",
+  "__pycache__",
+  ".venv",
+  "venv",
+  "data",
+  "models",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+force-wrap-aliases = true
+
+[tool.mypy]
+python_version = "3.13"
+ignore_missing_imports = true
+pretty = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = [
+  "cupy.*",
+  "torch.*",
+  "numba.*",
+]
+ignore_missing_imports = true

@@ -1,11 +1,11 @@
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox, ttk
 
-# Import your engine and core logic
-import importlib
-engine_mod = importlib.import_module("gameotherother")
+from checkers.eval import get_neural_evaluator
+from checkers.training.selfplay import SelfPlayTrainer
+from checkers import engine as engine_mod
 
 # Convenience aliases from your engine
 rc = engine_mod.rc
@@ -19,8 +19,7 @@ count_pieces = engine_mod.count_pieces
 get_engine = engine_mod.get_engine
 
 # Neural evaluator and trainer
-from neural_eval import get_neural_evaluator
-from selfplay_trainer import SelfPlayTrainer
+
 
 # -------------------- GUI Config --------------------
 

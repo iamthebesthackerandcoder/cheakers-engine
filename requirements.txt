@@ -1,0 +1,6 @@
+numpy>=1.26
+
+# Optional acceleration / extras (install as needed)
+# numba>=0.59
+# cupy>=12.0
+# torch>=2.2

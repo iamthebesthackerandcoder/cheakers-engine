@@ -12,6 +12,7 @@ import re
 import time
 import os
 import random
+import logging
 from typing import Optional
 
 import numpy as np
@@ -667,7 +668,7 @@ class SearchEngine:
         if depth == 0:
             self.leaf_buffer.append((self.board.copy(), self.side))
             if len(self.leaf_buffer) < 2:
-                print("Fallback to single eval")
+                logging.debug("Fallback to single eval")
                 return self.quiescence(alpha, beta, ply)
             else:
                 batch_size_actual = min(self.batch_size, len(self.leaf_buffer))
@@ -676,7 +677,7 @@ class SearchEngine:
                 batch_values = self.batch_eval(np.array(batch_boards), np.array(batch_sides))
                 score = batch_values[-1]  # for current leaf
                 del self.leaf_buffer[-batch_size_actual:]
-                print(f"Used batch size {batch_size_actual}")
+                logging.debug(f"Used batch size {batch_size_actual}")
                 return score
 
         moves = self.gen_moves(self.side)

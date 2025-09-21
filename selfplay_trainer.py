@@ -14,6 +14,12 @@ from multiprocessing import Pool, Manager
 
 # Import the neural evaluator from the previous implementation
 from neural_eval import NeuralEvaluator, TrainingDataCollector, get_neural_evaluator
+from config import (
+    DEFAULT_SEARCH_DEPTHS,
+    EPSILON_START,
+    EPSILON_END,
+    EPSILON_DECAY_GAMES,
+)
 
 class SelfPlayTrainer:
     """
@@ -36,10 +42,10 @@ class SelfPlayTrainer:
             'random_moves_total': 0,  # Total random moves across all games
             'random_moves_per_game': []  # Random moves per game for tracking
         }
-        # Epsilon schedule parameters
-        self.epsilon_start = 0.10  # 10% initial exploration
-        self.epsilon_end = 0.01    # 1% final exploration
-        self.epsilon_decay_games = 100  # Decay over 100 games by default
+        # Epsilon schedule parameters (from config)
+        self.epsilon_start = EPSILON_START
+        self.epsilon_end = EPSILON_END
+        self.epsilon_decay_games = EPSILON_DECAY_GAMES
         self.current_epsilon = self.epsilon_start  # Current epsilon value
         
         # Load previous training progress if specified
@@ -72,64 +78,7 @@ class SelfPlayTrainer:
         return opponent
 
     def _play_single_game(self, game_num, epsilon, base_evaluator, opponent_evaluator, shared_tt):
-        from gameotherother import initial_board, legal_moves, apply_move, is_terminal, SearchEngine
-        evaluator1 = base_evaluator
-        evaluator2 = opponent_evaluator
-        engine1 = SearchEngine(seed=random.randint(0, 10000), shared_tt=shared_tt)
-        engine2 = SearchEngine(seed=random.randint(0, 10000), shared_tt=shared_tt)
-        engine1.neural_evaluator = evaluator1
-        engine2.neural_evaluator = evaluator2
-        board = initial_board()
-        player = 1  # Black starts
-        move_count = 0
-        random_moves_count = 0  # Track random moves in this game
-        game_positions = []  # Store positions for this game
-        game_start = time.time()
-        while move_count < 200:
-            if is_terminal(board, player):
-                break
-            # Store position before move
-            game_positions.append((board[:], player))
-            # Choose engine based on player
-            current_engine = engine1 if player == 1 else engine2
-            # Exploration: use current epsilon for random move probability
-            depth = random.choice([4, 5, 6])  # Vary search depth
-            try:
-                if random.random() < epsilon:
-                    moves = legal_moves(board, player)
-                    best_move = random.choice(moves) if moves else None
-                    random_moves_count += 1  # Increment random moves counter
-                    _ = 0
-                else:
-                    _, best_move = current_engine.search(board, player, depth)
-            except Exception:
-                # Fallback to random legal move if search fails
-                moves = legal_moves(board, player)
-                best_move = random.choice(moves) if moves else None
-                random_moves_count += 1  # Count fallback as random move
-            if best_move is None:
-                break
-            # Apply move
-            board = apply_move(board, best_move)
-            player = -player
-            move_count += 1
-        # Determine game result
-        if is_terminal(board, player):
-            # Current player to move has no legal moves - they lose
-            game_result = -player  # Winner is the opposite player
-        else:
-            # Draw (max moves reached)
-            game_result = 0
-        # Convert game result to training targets
-        game_positions_list = []
-        for board_state, pos_player in game_positions:
-            if game_result == 0:
-                target_score = 0.0  # Draw
-            else:
-                target_score = 1.0 if pos_player == game_result else -1.0
-            game_positions_list.append((board_state, pos_player, target_score))
-        game_time = time.time() - game_start
-        return game_result, len(game_positions), move_count, random_moves_count, game_positions_list, game_time
+        return _play_single_game_core(game_num, epsilon, base_evaluator, opponent_evaluator, shared_tt, deepcopy_evaluators=False)
     
     
     def train_on_collected_data(self, epochs=2, batch_size=1024, lr=5e-4, l2=1e-6):
@@ -147,9 +96,9 @@ class SelfPlayTrainer:
         return stats
     
     def run_training_session(self, num_games=100, save_interval=10, num_workers=4,
-                             model_save_path="neural_model.pkl",
-                             data_save_path="training_data.pkl",
-                             checkpoint_path="training_checkpoint.pkl",
+                             model_save_path="data/neural_model.pkl",
+                             data_save_path="data/training_data.pkl",
+                             checkpoint_path="data/training_checkpoint.pkl",
                              progress_callback=None):
         """
         Run a complete self-play training session.
@@ -245,6 +194,10 @@ class SelfPlayTrainer:
         """
         Save complete training checkpoint including model, stats, and collected data.
         """
+        # Ensure directory exists
+        chk_dir = os.path.dirname(checkpoint_path)
+        if chk_dir and not os.path.exists(chk_dir):
+            os.makedirs(chk_dir, exist_ok=True)
         checkpoint_data = {
             'games_played': self.games_played,
             'total_positions': self.total_positions,
@@ -281,12 +234,33 @@ class SelfPlayTrainer:
                 'avg_game_length': 0, 'positions_collected': 0
             })
             
-            # Restore collected training data
-            data_path = "training_data.npz"
-            if os.path.exists(data_path):
-                self.training_data.load_training_data(data_path)
-            else:
-                print(f"Warning: Training data {data_path} not found, starting empty.")
+            # Restore collected training data (prefer .npz, try common locations near checkpoint)
+            chk_dir = os.path.dirname(checkpoint_path) or "."
+            candidates = [
+                os.path.join(chk_dir, "training_data.npz"),
+                os.path.join(chk_dir, "training_data.pkl"),
+                "training_data.npz",
+                "training_data.pkl",
+            ]
+            loaded = False
+            for cand in candidates:
+                # Only load .npz; if .pkl path is given, look for the .npz with same stem
+                load_path = cand
+                if cand.endswith('.pkl'):
+                    npz_path = cand.rsplit('.', 1)[0] + '.npz'
+                    if os.path.exists(npz_path):
+                        load_path = npz_path
+                    else:
+                        continue
+                if os.path.exists(load_path) and load_path.endswith('.npz'):
+                    try:
+                        self.training_data.load_training_data(load_path)
+                        loaded = True
+                        break
+                    except Exception:
+                        pass
+            if not loaded:
+                print("Warning: Training data not found, starting with empty buffer.")
             
             # Restore model state
             if 'model_weights' in checkpoint_data:
@@ -307,14 +281,20 @@ class SelfPlayTrainer:
             print(f"Error loading checkpoint: {e}")
             return False
     
-    def save_training_progress(self, model_save_path="neural_model.pkl", data_save_path="training_data.pkl", checkpoint_path="training_checkpoint.pkl"):
+    def save_training_progress(self, model_save_path="data/neural_model.pkl", data_save_path="data/training_data.pkl", checkpoint_path="data/training_checkpoint.pkl"):
         """Save model, training data, and checkpoint after training chunk."""
         # Save updated model (full evaluator)
+        model_dir = os.path.dirname(model_save_path)
+        if model_dir and not os.path.exists(model_dir):
+            os.makedirs(model_dir, exist_ok=True)
         with open(model_save_path, 'wb') as f:
             pickle.dump(self.base_evaluator, f)
         print(f"Model saved to: {model_save_path}")
         
         # Save training data (positions and scores)
+        data_dir = os.path.dirname(data_save_path)
+        if data_dir and not os.path.exists(data_dir):
+            os.makedirs(data_dir, exist_ok=True)
         data_save_path = data_save_path.rsplit('.', 1)[0] + '.npz'
         np.savez_compressed(data_save_path, positions=np.array(self.training_data.positions), scores=np.array(self.training_data.scores), allow_pickle=False)
         print(f"Training data saved to: {data_save_path}")
@@ -385,7 +365,11 @@ class TrainingUI:
             self.is_training = True
             self.training_thread = threading.Thread(
                 target=self.trainer.run_training_session,
-                args=(num_games, save_interval, model_path, data_path),
+                args=(num_games, save_interval),
+                kwargs={
+                    "model_save_path": model_path,
+                    "data_save_path": data_path,
+                },
                 daemon=True
             )
             self.training_thread.start()
@@ -554,11 +538,14 @@ def _training_error(self, error_msg):
     return training_button_code
 
 
-def _play_single_game_worker(args):
-    game_num, epsilon, base_evaluator, opponent_evaluator, shared_tt = args
-    evaluator1 = deepcopy(base_evaluator)
-    evaluator2 = deepcopy(opponent_evaluator)
+def _play_single_game_worker(game_num, epsilon, base_evaluator, opponent_evaluator, shared_tt):
+    return _play_single_game_core(game_num, epsilon, base_evaluator, opponent_evaluator, shared_tt, deepcopy_evaluators=True)
+
+def _play_single_game_core(game_num, epsilon, base_evaluator, opponent_evaluator, shared_tt, deepcopy_evaluators=False):
+    """Shared implementation used by both sequential and parallel runners."""
     from gameotherother import initial_board, legal_moves, apply_move, is_terminal, SearchEngine
+    evaluator1 = deepcopy(base_evaluator) if deepcopy_evaluators else base_evaluator
+    evaluator2 = deepcopy(opponent_evaluator) if deepcopy_evaluators else opponent_evaluator
     engine1 = SearchEngine(seed=random.randint(0, 10000), shared_tt=shared_tt)
     engine2 = SearchEngine(seed=random.randint(0, 10000), shared_tt=shared_tt)
     engine1.neural_evaluator = evaluator1
@@ -577,7 +564,7 @@ def _play_single_game_worker(args):
         # Choose engine based on player
         current_engine = engine1 if player == 1 else engine2
         # Exploration: use current epsilon for random move probability
-        depth = random.choice([4, 5, 6])  # Vary search depth
+        depth = random.choice(DEFAULT_SEARCH_DEPTHS)  # Vary search depth
         try:
             if random.random() < epsilon:
                 moves = legal_moves(board, player)
