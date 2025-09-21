@@ -27,7 +27,7 @@ class SelfPlayTrainer:
     between different versions of the neural network, and performs simple
     supervised updates to the base network.
     """
-    
+
     def __init__(self, base_evaluator=None, resume_from_checkpoint=None):
         self.base_evaluator = base_evaluator or get_neural_evaluator()
         self.training_data = TrainingDataCollector(use_augmentation=True)
@@ -47,11 +47,11 @@ class SelfPlayTrainer:
         self.epsilon_end = EPSILON_END
         self.epsilon_decay_games = EPSILON_DECAY_GAMES
         self.current_epsilon = self.epsilon_start  # Current epsilon value
-        
+
         # Load previous training progress if specified
         if resume_from_checkpoint:
             self.load_checkpoint(resume_from_checkpoint)
-        
+
     def create_opponent_evaluator(self, noise_level=0.3, mutation_rate=0.15):
         """
         Create a slightly different version of the evaluator for opponent play.
@@ -59,10 +59,10 @@ class SelfPlayTrainer:
         """
         opponent = NeuralEvaluator()
         opponent.weights = {k: v.copy() if isinstance(v, np.ndarray) else deepcopy(v) for k, v in self.base_evaluator.weights.items()}
-        
+
         # Use random seed based on time to ensure different opponents
         np.random.seed(None)  # Use current time as seed
-        
+
         # Add noise to create variation
         for layer in opponent.weights:
             # Keys are strings like 'W1', 'b1', ...
@@ -74,19 +74,19 @@ class SelfPlayTrainer:
                 noise = np.random.randn(*opponent.weights[layer].shape) * noise_level * 0.5
                 mask = np.random.random(opponent.weights[layer].shape) < mutation_rate
                 opponent.weights[layer] += noise * mask
-                
+
         return opponent
 
     def _play_single_game(self, game_num, epsilon, base_evaluator, opponent_evaluator, shared_tt):
         return _play_single_game_core(game_num, epsilon, base_evaluator, opponent_evaluator, shared_tt, deepcopy_evaluators=False)
-    
-    
+
+
     def train_on_collected_data(self, epochs=2, batch_size=1024, lr=5e-4, l2=1e-6):
         """Perform a simple supervised training pass on the collected data."""
         if len(self.training_data.positions) == 0:
             print("No training data collected yet.")
             return None
-        
+
         X = np.array(self.training_data.positions, dtype=np.float32)
         y = np.array(self.training_data.scores, dtype=np.float32)
         print(f"Training on {len(X)} positions...")
@@ -94,7 +94,7 @@ class SelfPlayTrainer:
             X, y, epochs=epochs, batch_size=batch_size, lr=lr, l2=l2, shuffle=True, verbose=True
         )
         return stats
-    
+
     def run_training_session(self, num_games=100, save_interval=10, num_workers=4,
                              model_save_path="data/neural_model.pkl",
                              data_save_path="data/training_data.pkl",
@@ -108,41 +108,41 @@ class SelfPlayTrainer:
         print(f"Model will be saved to: {model_save_path}")
         print(f"Training data will be saved to: {data_save_path}")
         print("-" * 60)
-        
+
         start_time = time.time()
-        
-        if num_workers == 1:
+
+        if num_games < num_workers * 2:
             shared_tt = None
             for game_num in range(num_games):
                 # Update epsilon based on current game number (linear decay)
                 progress = min(1.0, (game_num) / max(1, self.epsilon_decay_games))
                 self.current_epsilon = self.epsilon_start - (self.epsilon_start - self.epsilon_end) * progress
-                
+
                 opponent = self.create_opponent_evaluator()
                 result, positions, moves, random_moves, game_positions_list, game_time = self._play_single_game(game_num, self.current_epsilon, self.base_evaluator, opponent, shared_tt)
-                
+
                 # Update exploration tracking stats
                 self.training_stats['random_moves_total'] += random_moves
                 self.training_stats['random_moves_per_game'].append(random_moves)
-                
+
                 if result == 1:
                     self.training_stats['black_wins'] += 1
                 elif result == -1:
                     self.training_stats['red_wins'] += 1
                 else:
                     self.training_stats['draws'] += 1
-                
+
                 self.games_played += 1
                 self.total_positions += positions
                 self.training_stats['positions_collected'] = self.total_positions
-                
+
                 total_games = self.training_stats['black_wins'] + self.training_stats['red_wins'] + self.training_stats['draws']
                 if total_games > 0:
                     self.training_stats['avg_game_length'] = ((self.training_stats['avg_game_length'] * (total_games - 1)) + moves) / total_games
-                
+
                 for board_state, pos_player, target_score in game_positions_list:
                     self.training_data.add_position(board_state, pos_player, target_score)
-                
+
                 # Print progress with exploration metrics
                 if (game_num + 1) % 5 == 0 or game_num == 0:
                     result_str = "Black wins" if result == 1 else "Red wins" if result == -1 else "Draw"
@@ -151,11 +151,11 @@ class SelfPlayTrainer:
                           f"Moves: {moves:3d} | Positions: {positions:3d} | "
                           f"Random: {random_moves:2d} (ε={self.current_epsilon:.3f}) | "
                           f"Time: {game_time:.2f}s")
-                
+
                 # Report progress
                 if progress_callback:
                     progress_callback(game_num + 1, num_games)
-                
+
                 # Save progress and train periodically
                 if (game_num + 1) % save_interval == 0:
                     # Train on the data collected so far
@@ -171,11 +171,11 @@ class SelfPlayTrainer:
         else:
             runner = ParallelGameRunner(self, num_workers)
             runner.run_games(num_games, save_interval, model_save_path, data_save_path, checkpoint_path, progress_callback)
-        
+
         # Final report
         if progress_callback:
             progress_callback(num_games, num_games)
-        
+
         # Final train and save
         if len(self.training_data.positions) > 0:
             stats = self.train_on_collected_data(epochs=3, batch_size=1024, lr=5e-4, l2=1e-6)
@@ -183,13 +183,13 @@ class SelfPlayTrainer:
                 print(f"Final training: MSE {stats['loss']:.4f} on {stats['count']} samples")
 
         self.save_training_progress(model_save_path, data_save_path, checkpoint_path)
-        
+
         elapsed_time = time.time() - start_time
         print(f"\nTraining session completed!")
         print(f"Total time: {elapsed_time:.2f} seconds")
         print(f"Games per second: {num_games / max(1e-9, elapsed_time):.2f}")
         self.print_training_stats()
-    
+
     def save_checkpoint(self, checkpoint_path):
         """
         Save complete training checkpoint including model, stats, and collected data.
@@ -209,11 +209,11 @@ class SelfPlayTrainer:
                 'adam_t': self.base_evaluator.adam_t
             }
         }
-        
+
         with open(checkpoint_path, 'wb') as f:
             pickle.dump(checkpoint_data, f)
         print(f"Training checkpoint saved to: {checkpoint_path}")
-    
+
     def load_checkpoint(self, checkpoint_path):
         """
         Load training checkpoint and resume from where we left off.
@@ -221,11 +221,11 @@ class SelfPlayTrainer:
         if not os.path.exists(checkpoint_path):
             print(f"Checkpoint file not found: {checkpoint_path}")
             return False
-        
+
         try:
             with open(checkpoint_path, 'rb') as f:
                 checkpoint_data = pickle.load(f)
-            
+
             # Restore training progress
             self.games_played = checkpoint_data.get('games_played', 0)
             self.total_positions = checkpoint_data.get('total_positions', 0)
@@ -233,7 +233,7 @@ class SelfPlayTrainer:
                 'black_wins': 0, 'red_wins': 0, 'draws': 0,
                 'avg_game_length': 0, 'positions_collected': 0
             })
-            
+
             # Restore collected training data (prefer .npz, try common locations near checkpoint)
             chk_dir = os.path.dirname(checkpoint_path) or "."
             candidates = [
@@ -261,26 +261,26 @@ class SelfPlayTrainer:
                         pass
             if not loaded:
                 print("Warning: Training data not found, starting with empty buffer.")
-            
+
             # Restore model state
             if 'model_weights' in checkpoint_data:
                 self.base_evaluator.weights = checkpoint_data['model_weights']
-            
+
             # Restore Adam optimizer state
             adam_state = checkpoint_data.get('adam_state', {})
             if adam_state:
                 self.base_evaluator.adam_m = adam_state.get('adam_m', {})
                 self.base_evaluator.adam_v = adam_state.get('adam_v', {})
                 self.base_evaluator.adam_t = adam_state.get('adam_t', 0)
-            
+
             print(f"Training checkpoint loaded from: {checkpoint_path}")
             print(f"Resuming from game {self.games_played + 1} with {self.total_positions} collected positions")
             return True
-            
+
         except Exception as e:
             print(f"Error loading checkpoint: {e}")
             return False
-    
+
     def save_training_progress(self, model_save_path="data/neural_model.pkl", data_save_path="data/training_data.pkl", checkpoint_path="data/training_checkpoint.pkl"):
         """Save model, training data, and checkpoint after training chunk."""
         # Save updated model (full evaluator)
@@ -290,7 +290,7 @@ class SelfPlayTrainer:
         with open(model_save_path, 'wb') as f:
             pickle.dump(self.base_evaluator, f)
         print(f"Model saved to: {model_save_path}")
-        
+
         # Save training data (positions and scores)
         data_dir = os.path.dirname(data_save_path)
         if data_dir and not os.path.exists(data_dir):
@@ -298,18 +298,18 @@ class SelfPlayTrainer:
         data_save_path = data_save_path.rsplit('.', 1)[0] + '.npz'
         np.savez_compressed(data_save_path, positions=np.array(self.training_data.positions), scores=np.array(self.training_data.scores), allow_pickle=False)
         print(f"Training data saved to: {data_save_path}")
-        
+
         # Save checkpoint (stats, partial data, model state)
         self.save_checkpoint(checkpoint_path)
-    
+
     def print_training_stats(self):
         """Print current training statistics."""
         total_games = self.training_stats['black_wins'] + self.training_stats['red_wins'] + self.training_stats['draws']
-        
+
         if total_games == 0:
             print("No games played yet.")
             return
-        
+
         print("TRAINING STATISTICS:")
         print(f"  Total games played: {total_games}")
         print(f"  Black wins: {self.training_stats['black_wins']} ({100*self.training_stats['black_wins']/total_games:.1f}%)")
@@ -326,12 +326,12 @@ class SelfPlayTrainer:
 
 class TrainingUI:
     """Simple command-line interface for training management."""
-    
+
     def __init__(self):
         self.trainer = None
         self.is_training = False
         self.training_thread = None
-    
+
     def show_menu(self):
         """Display the main training menu."""
         print("\n" + "="*60)
@@ -345,22 +345,22 @@ class TrainingUI:
         print("6. Settings")
         print("0. Exit")
         print("-"*60)
-    
+
     def start_training_session(self):
         """Start a new training session with user parameters."""
         try:
             num_games = int(input("Number of games to play (default 100): ") or "100")
             save_interval = int(input("Save progress every N games (default 25): ") or "25")
-            
+
             model_path = input("Model save path (default 'neural_model.pkl'): ") or "neural_model.pkl"
             data_path = input("Data save path (default 'training_data.pkl'): ") or "training_data.pkl"
-            
+
             print(f"\nStarting training session...")
             print(f"Games: {num_games}, Save interval: {save_interval}")
-            
+
             # Initialize trainer
             self.trainer = SelfPlayTrainer()
-            
+
             # Run in separate thread to allow interruption
             self.is_training = True
             self.training_thread = threading.Thread(
@@ -373,7 +373,7 @@ class TrainingUI:
                 daemon=True
             )
             self.training_thread.start()
-            
+
             # Monitor training
             while self.is_training and self.training_thread.is_alive():
                 try:
@@ -382,48 +382,48 @@ class TrainingUI:
                     print("\nTraining interrupted by user.")
                     self.is_training = False
                     break
-            
+
             if not self.training_thread.is_alive():
                 self.is_training = False
                 print("Training completed successfully!")
-                
+
         except ValueError:
             print("Invalid input. Please enter numeric values.")
         except Exception as e:
             print(f"Error during training: {e}")
             self.is_training = False
-    
+
     def continue_training(self):
         """Continue training with an existing model."""
         model_path = input("Path to existing model (default 'neural_model.pkl'): ") or "neural_model.pkl"
-        
+
         if not os.path.exists(model_path):
             print(f"Model file not found: {model_path}")
             return
-        
+
         try:
             # Load existing model
             evaluator = NeuralEvaluator(model_path)
             self.trainer = SelfPlayTrainer(evaluator)
-            
+
             print(f"Loaded model from {model_path}")
             self.start_training_session()
-            
+
         except Exception as e:
             print(f"Error loading model: {e}")
-    
+
     def view_stats(self):
         """View training statistics."""
         stats_path = input("Path to stats file (default 'training_data_stats.pkl'): ") or "training_data_stats.pkl"
-        
+
         if not os.path.exists(stats_path):
             print(f"Stats file not found: {stats_path}")
             return
-        
+
         try:
             with open(stats_path, 'rb') as f:
                 stats = pickle.load(f)
-            
+
             total_games = stats['black_wins'] + stats['red_wins'] + stats['draws']
             print("\nTRAINING STATISTICS:")
             print(f"Total games: {total_games}")
@@ -432,18 +432,18 @@ class TrainingUI:
             print(f"Draws: {stats['draws']} ({100*stats['draws']/total_games:.1f}%)")
             print(f"Avg game length: {stats['avg_game_length']:.1f} moves")
             print(f"Positions collected: {stats['positions_collected']}")
-            
+
         except Exception as e:
             print(f"Error loading stats: {e}")
-    
+
     def run(self):
         """Main training UI loop."""
         while True:
             self.show_menu()
-            
+
             try:
                 choice = input("Select option: ").strip()
-                
+
                 if choice == '1':
                     self.start_training_session()
                 elif choice == '2':
@@ -464,7 +464,7 @@ class TrainingUI:
                         break
                 else:
                     print("Invalid option. Please try again.")
-                    
+
             except KeyboardInterrupt:
                 print("\nExiting...")
                 if self.is_training:
@@ -492,31 +492,31 @@ def _start_training(self):
     """Start self-play training in a separate window."""
     import tkinter.simpledialog as simpledialog
     import tkinter.messagebox as messagebox
-    
+
     # Get training parameters
-    num_games = simpledialog.askinteger("Training Setup", 
-                                       "Number of games to play:", 
-                                       initialvalue=50, 
-                                       minvalue=1, 
+    num_games = simpledialog.askinteger("Training Setup",
+                                       "Number of games to play:",
+                                       initialvalue=50,
+                                       minvalue=1,
                                        maxvalue=1000)
     if not num_games:
         return
-    
+
     # Start training in background
     self.training_active = True
     self.btn_train.configure(text="Training...", state="disabled")
-    
+
     def run_training():
         try:
             trainer = SelfPlayTrainer()
             trainer.run_training_session(num_games, save_interval=10)
-            
+
             # Update UI when done
             self.after(0, self._training_completed)
-            
+
         except Exception as e:
             self.after(0, lambda: self._training_error(str(e)))
-    
+
     import threading
     threading.Thread(target=run_training, daemon=True).start()
 
@@ -524,7 +524,7 @@ def _training_completed(self):
     """Called when training completes successfully."""
     self.training_active = False
     self.btn_train.configure(text="Train AI", state="normal")
-    messagebox.showinfo("Training Complete", 
+    messagebox.showinfo("Training Complete",
                        "Self-play training completed successfully!\\n"
                        "Neural network has been updated with new data.")
 
@@ -534,7 +534,7 @@ def _training_error(self, error_msg):
     self.btn_train.configure(text="Train AI", state="normal")
     messagebox.showerror("Training Error", f"Training failed: {error_msg}")
 '''
-    
+
     return training_button_code
 
 

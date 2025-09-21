@@ -220,12 +220,16 @@ def evaluate(board: Board, player: int) -> int:
 class SearchEngine:
     def __init__(self, seed: Optional[int] = None, shared_tt: Optional[Dict[str, Any]] = None) -> None:
         self.neural_evaluator: Optional[Any] = None
-        self.shared_tt = shared_tt
+        self.tt = shared_tt if shared_tt is not None else {}
 
     def _eval(self, board: Board, player: int) -> int:
+        key = str(tuple(board)) + f"_{player}"
+        if key in self.tt:
+            return int(self.tt[key])
         if self.neural_evaluator is not None:
             try:
                 val = float(self.neural_evaluator.evaluate_position(board, player))
+                self.tt[key] = val
                 return int(val)
             except Exception:
                 pass
