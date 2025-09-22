@@ -12,6 +12,17 @@ import os
 import multiprocessing as mp
 from multiprocessing import Pool, Manager
 
+from typing import Optional, Dict, Any, List, Tuple, Callable, Union
+
+# Type aliases for better readability (avoiding circular imports)
+Board = List[int]  # Board state: index 0 is unused, 1-32 are squares
+Player = int  # 1 for black, -1 for red
+GameResult = Tuple[int, Optional[List[int]]]  # (score, best_move)
+TrainingStats = Dict[str, Any]  # Statistics from a training session
+CacheStats = Dict[str, Any]
+NeuralNetworkProtocol = Any  # Protocol for neural network implementations
+TrainingDataCollectorProtocol = Any  # Protocol for training data collection
+
 # Import the neural evaluator from the previous implementation
 from neural_eval import NeuralEvaluator, TrainingDataCollector, get_neural_evaluator
 from config import (
@@ -28,25 +39,19 @@ class SelfPlayTrainer:
     supervised updates to the base network.
     """
 
-    def __init__(self, base_evaluator=None, resume_from_checkpoint=None):
-        self.base_evaluator = base_evaluator or get_neural_evaluator()
-        self.training_data = TrainingDataCollector(use_augmentation=True)
-        self.games_played = 0
-        self.total_positions = 0
-        self.training_stats = {
-            'black_wins': 0,
-            'red_wins': 0,
-            'draws': 0,
-            'avg_game_length': 0,
-            'positions_collected': 0,
-            'random_moves_total': 0,  # Total random moves across all games
-            'random_moves_per_game': []  # Random moves per game for tracking
-        }
+    def __init__(self, base_evaluator: Optional[NeuralEvaluator] = None,
+                 resume_from_checkpoint: Optional[str] = None) -> None:
+        """Initialize the self-play trainer."""
+        self.base_evaluator: NeuralEvaluator = base_evaluator or get_neural_evaluator()
+        self.training_data: TrainingDataCollector = TrainingDataCollector(use_augmentation=True)
+        self.games_played: int = 0
+        self.total_positions: int = 0
+        self.training_stats: TrainingStats = dict()
         # Epsilon schedule parameters (from config)
-        self.epsilon_start = EPSILON_START
-        self.epsilon_end = EPSILON_END
-        self.epsilon_decay_games = EPSILON_DECAY_GAMES
-        self.current_epsilon = self.epsilon_start  # Current epsilon value
+        self.epsilon_start: float = EPSILON_START
+        self.epsilon_end: float = EPSILON_END
+        self.epsilon_decay_games: int = EPSILON_DECAY_GAMES
+        self.current_epsilon: float = self.epsilon_start  # Current epsilon value
 
         # Load previous training progress if specified
         if resume_from_checkpoint:
@@ -122,23 +127,25 @@ class SelfPlayTrainer:
                 result, positions, moves, random_moves, game_positions_list, game_time = self._play_single_game(game_num, self.current_epsilon, self.base_evaluator, opponent, shared_tt)
 
                 # Update exploration tracking stats
-                self.training_stats['random_moves_total'] += random_moves
-                self.training_stats['random_moves_per_game'].append(random_moves)
+                self.training_stats.random_moves_total += random_moves
+                if not hasattr(self.training_stats, 'random_moves_per_game'):
+                    self.training_stats.random_moves_per_game = []
+                self.training_stats.random_moves_per_game.append(random_moves)
 
                 if result == 1:
-                    self.training_stats['black_wins'] += 1
+                    self.training_stats.black_wins += 1
                 elif result == -1:
-                    self.training_stats['red_wins'] += 1
+                    self.training_stats.red_wins += 1
                 else:
-                    self.training_stats['draws'] += 1
+                    self.training_stats.draws += 1
 
                 self.games_played += 1
                 self.total_positions += positions
-                self.training_stats['positions_collected'] = self.total_positions
+                self.training_stats.positions_collected = self.total_positions
 
-                total_games = self.training_stats['black_wins'] + self.training_stats['red_wins'] + self.training_stats['draws']
+                total_games: int = self.training_stats.black_wins + self.training_stats.red_wins + self.training_stats.draws
                 if total_games > 0:
-                    self.training_stats['avg_game_length'] = ((self.training_stats['avg_game_length'] * (total_games - 1)) + moves) / total_games
+                    self.training_stats.avg_game_length = ((self.training_stats.avg_game_length * (total_games - 1)) + moves) / total_games
 
                 for board_state, pos_player, target_score in game_positions_list:
                     self.training_data.add_position(board_state, pos_player, target_score)
@@ -146,7 +153,7 @@ class SelfPlayTrainer:
                 # Print progress with exploration metrics
                 if (game_num + 1) % 5 == 0 or game_num == 0:
                     result_str = "Black wins" if result == 1 else "Red wins" if result == -1 else "Draw"
-                    avg_random_moves = sum(self.training_stats['random_moves_per_game'][-5:]) / min(5, len(self.training_stats['random_moves_per_game']))
+                    avg_random_moves = sum(self.training_stats.random_moves_per_game[-5:]) / min(5, len(self.training_stats.random_moves_per_game))
                     print(f"Game {game_num + 1:3d}: {result_str:10s} | "
                           f"Moves: {moves:3d} | Positions: {positions:3d} | "
                           f"Random: {random_moves:2d} (ε={self.current_epsilon:.3f}) | "
@@ -302,9 +309,9 @@ class SelfPlayTrainer:
         # Save checkpoint (stats, partial data, model state)
         self.save_checkpoint(checkpoint_path)
 
-    def print_training_stats(self):
+    def print_training_stats(self) -> None:
         """Print current training statistics."""
-        total_games = self.training_stats['black_wins'] + self.training_stats['red_wins'] + self.training_stats['draws']
+        total_games: int = self.training_stats.black_wins + self.training_stats.red_wins + self.training_stats.draws
 
         if total_games == 0:
             print("No games played yet.")
@@ -312,14 +319,14 @@ class SelfPlayTrainer:
 
         print("TRAINING STATISTICS:")
         print(f"  Total games played: {total_games}")
-        print(f"  Black wins: {self.training_stats['black_wins']} ({100*self.training_stats['black_wins']/total_games:.1f}%)")
-        print(f"  Red wins: {self.training_stats['red_wins']} ({100*self.training_stats['red_wins']/total_games:.1f}%)")
-        print(f"  Draws: {self.training_stats['draws']} ({100*self.training_stats['draws']/total_games:.1f}%)")
-        print(f"  Average game length: {self.training_stats['avg_game_length']:.1f} moves")
-        print(f"  Total positions collected: {self.training_stats['positions_collected']}")
+        print(f"  Black wins: {self.training_stats.black_wins} ({100*self.training_stats.black_wins/total_games:.1f}%)")
+        print(f"  Red wins: {self.training_stats.red_wins} ({100*self.training_stats.red_wins/total_games:.1f}%)")
+        print(f"  Draws: {self.training_stats.draws} ({100*self.training_stats.draws/total_games:.1f}%)")
+        print(f"  Average game length: {self.training_stats.avg_game_length:.1f} moves")
+        print(f"  Total positions collected: {self.training_stats.positions_collected}")
         if total_games > 0:
-            avg_random_per_game = self.training_stats['random_moves_total'] / total_games
-            print(f"  Total random moves: {self.training_stats['random_moves_total']}")
+            avg_random_per_game: float = self.training_stats.random_moves_total / total_games
+            print(f"  Total random moves: {self.training_stats.random_moves_total}")
             print(f"  Average random moves per game: {avg_random_per_game:.1f}")
             print(f"  Current epsilon: {self.current_epsilon:.3f}")
 
@@ -608,22 +615,33 @@ class ParallelGameRunner:
         self.trainer = trainer
         self.num_workers = num_workers
         self.shared_tt = Manager().dict()
+
+        # Use spawn method for better compatibility and performance
         try:
             mp.set_start_method('spawn', force=True)
         except RuntimeError:
+            # Already set, continue
             pass
+
+        # Create pool with better initialization
         self.pool = Pool(self.num_workers)
 
     def run_games(self, num_games, save_interval, model_save_path, data_save_path, checkpoint_path, progress_callback=None):
         batch_size = self.num_workers * 5
+
+        # Pre-calculate epsilon values for the entire batch to avoid repeated calculations
+        epsilon_values = []
+        for game_num in range(num_games):
+            progress = min(1.0, game_num / max(1, self.trainer.epsilon_decay_games))
+            epsilon = self.trainer.epsilon_start - (self.trainer.epsilon_start - self.trainer.epsilon_end) * progress
+            epsilon_values.append(epsilon)
+
         for start in range(0, num_games, batch_size):
             end = min(start + batch_size, num_games)
             batch_params = []
             for game_num in range(start, end):
-                progress = min(1.0, game_num / max(1, self.trainer.epsilon_decay_games))
-                epsilon = self.trainer.epsilon_start - (self.trainer.epsilon_start - self.trainer.epsilon_end) * progress
                 opponent = self.trainer.create_opponent_evaluator()
-                batch_params.append((game_num, epsilon, self.trainer.base_evaluator, opponent, self.shared_tt))
+                batch_params.append((game_num, epsilon_values[game_num], self.trainer.base_evaluator, opponent, self.shared_tt))
             batch_results = self.pool.starmap(_play_single_game_worker, batch_params)
             for i, res in enumerate(batch_results):
                 game_num = start + i

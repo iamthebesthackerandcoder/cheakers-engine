@@ -1,6 +1,10 @@
 numpy>=1.26
 pydantic>=2.0
 
+# Type checking and development dependencies
+mypy>=1.8.0
+types-all>=1.0.0
+
 # Optional acceleration / extras (install as needed)
 # numba>=0.59
 # cupy>=12.0

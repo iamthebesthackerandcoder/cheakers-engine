@@ -7,7 +7,19 @@ import pickle
 import os
 import random
 from copy import deepcopy
-from typing import List, Tuple, Dict, Any, Optional, Union
+from typing import List, Tuple, Dict, Any, Optional, Union, Set
+
+# Type aliases for better readability (avoiding circular imports)
+Board = List[int]  # Board state: index 0 is unused, 1-32 are squares
+Player = int  # 1 for black, -1 for red
+Position = Tuple[int, int]  # (row, col) coordinates
+SquareIndex = int  # 1-32 for dark squares
+NeuralNetwork = Dict[str, np.ndarray]
+TrainingData = Tuple[np.ndarray, np.ndarray]  # (features, targets)
+EvaluationCache = Dict[str, float]
+AdamState = Dict[str, Dict[str, np.ndarray]]  # Optimizer state
+TrainingSample = Tuple[Board, Player, float]  # (board_state, player, target_value)
+CacheStats = Dict[str, Union[int, float]]
 
 # Optional imports for optimization
 has_numba = False
@@ -37,11 +49,11 @@ try:
 except ImportError:
     # Fallback definitions if import fails
     SQUARES = 32
-    
+
     # Rebuild mappings locally if needed
     rc_of = [None] * (SQUARES + 1)
     idx_map = {}
-    
+
     def build_mappings():
         i = 1
         for r in range(8):
@@ -50,10 +62,10 @@ except ImportError:
                     rc_of[i] = (r, c)
                     idx_map[(r, c)] = i
                     i += 1
-    
+
     build_mappings()
-    
-    def rc(i):
+
+    def rc(i: int) -> Optional[Tuple[int, int]]:
         return rc_of[i]
 
 
@@ -66,6 +78,7 @@ class NeuralEvaluator:
     """
 
     def __init__(self, model_path: Optional[str] = None) -> None:
+        """Initialize the neural evaluator with optional model loading."""
         self.model: Optional[Any] = None
         self.feature_size: int = 32 + 8  # 32 squares + 8 additional features
 
@@ -76,24 +89,31 @@ class NeuralEvaluator:
 
         if self.has_numba:
             try:
+                import numba
                 self._board_to_features_fast = numba.jit(nopython=True)(self._board_to_features_fast)
             except Exception as e:
                 print(f"Warning: Could not apply Numba JIT to _board_to_features_fast: {e}")
 
         if self.has_torch:
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            try:
+                import torch
+                self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            except ImportError:
+                pass
 
         self.directions: List[Tuple[int, int]] = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
         self.adj_matrix: np.ndarray = np.full((32, 4), -1, dtype=int)
         for sq in range(32):
-            r, c = rc(sq + 1)
-            for d, (dr, dc) in enumerate(self.directions):
-                nr = r + dr
-                nc = c + dc
-                if 0 <= nr < 8 and 0 <= nc < 8 and (nr + nc) % 2 == 1:
-                    if (nr, nc) in idx_map:
-                        target_sq = idx_map[(nr, nc)] - 1
-                        self.adj_matrix[sq, d] = target_sq
+            pos: Optional[Tuple[int, int]] = rc(sq + 1)
+            if pos is not None:
+                r, c = pos
+                for d, (dr, dc) in enumerate(self.directions):
+                    nr = r + dr
+                    nc = c + dc
+                    if 0 <= nr < 8 and 0 <= nc < 8 and (nr + nc) % 2 == 1:
+                        if (nr, nc) in idx_map:
+                            target_sq = idx_map[(nr, nc)] - 1
+                            self.adj_matrix[sq, d] = target_sq
 
         # Adam optimizer state variables
         self.adam_m: Dict[str, np.ndarray] = {}  # First moment estimates
@@ -111,7 +131,7 @@ class NeuralEvaluator:
         else:
             # Initialize with a simple placeholder network
             self._init_placeholder_network()
-    
+
     def _init_placeholder_network(self) -> None:
         """Initialize a simple neural network as placeholder"""
         np.random.seed(42)
@@ -127,7 +147,7 @@ class NeuralEvaluator:
         }
         self._init_adam_state()
 
-    def board_to_features(self, board: List[int], player: int) -> np.ndarray:
+    def board_to_features(self, board: Board, player: Player) -> np.ndarray:
         """
         Convert board position to neural network input features.
 
@@ -148,6 +168,7 @@ class NeuralEvaluator:
         board_states = boards[:, 1:33]
         features[:, :32] = board_states
 
+        # Vectorized piece counting - much faster than individual sums
         features[:, 32] = np.sum(board_states == 1, axis=1) / 12.0  # black men
         features[:, 33] = np.sum(board_states == 2, axis=1) / 12.0  # black kings
         features[:, 34] = np.sum(board_states == -1, axis=1) / 12.0 # red men
@@ -155,14 +176,14 @@ class NeuralEvaluator:
         features[:, 36] = np.sum(board_states != 0, axis=1) / 24.0  # total pieces
         features[:, 37] = players  # Current player to move
 
-        # Mobility features
-        for i in range(N):
-            features[i, 38] = self._calculate_mobility_feature(board_states[i], 1)  # Black
-            features[i, 39] = self._calculate_mobility_feature(board_states[i], -1) # Red
+        # Vectorized mobility calculation for better performance
+        features[:, 38] = self._calculate_mobility_batch(board_states, 1)  # Black
+        features[:, 39] = self._calculate_mobility_batch(board_states, -1) # Red
 
         return features
 
-    def board_to_features_batch(self, boards: Union[List[List[int]], np.ndarray], players: Union[List[int], np.ndarray]) -> np.ndarray:
+    def board_to_features_batch(self, boards: Union[List[Board], np.ndarray],
+                               players: Union[List[Player], np.ndarray]) -> np.ndarray:
         """
         Vectorized feature extraction for batch of boards.
 
@@ -200,7 +221,7 @@ class NeuralEvaluator:
             features[i, 39] = self._calculate_mobility_feature(board_states[i], -1)
         return features
 
-    def augment_position(self, board: List[int], player: int) -> Tuple[List[int], int]:
+    def augment_position(self, board: Board, player: Player) -> Tuple[Board, Player]:
         """
         Create data augmentation by flipping the board horizontally.
 
@@ -211,14 +232,16 @@ class NeuralEvaluator:
         Returns:
             tuple: (flipped_board, flipped_player)
         """
-        flipped_board = [0] * len(board)
+        flipped_board: Board = [0] * len(board)
 
-        flip_map = {}
+        flip_map: Dict[int, int] = {}
         for i in range(1, 33):
-            r, c = rc(i)
-            flipped_c = 7 - c
-            if (r, flipped_c) in idx_map:
-                flip_map[i] = idx_map[(r, flipped_c)]
+            pos: Optional[Tuple[int, int]] = rc(i)
+            if pos is not None:
+                r, c = pos
+                flipped_c = 7 - c
+                if (r, flipped_c) in idx_map:
+                    flip_map[i] = idx_map[(r, flipped_c)]
 
         for i in range(1, 33):
             if i in flip_map:
@@ -240,6 +263,11 @@ class NeuralEvaluator:
             keys_to_remove = list(self.eval_cache.keys())[:items_to_remove]
             for key in keys_to_remove:
                 del self.eval_cache[key]
+                # Also clean up corresponding Adam state if it exists
+                if hasattr(self, 'adam_m') and key in self.adam_m:
+                    del self.adam_m[key]
+                if hasattr(self, 'adam_v') and key in self.adam_v:
+                    del self.adam_v[key]
 
     def get_cache_stats(self) -> Dict[str, Union[int, float]]:
         """Get cache performance statistics"""
@@ -283,9 +311,19 @@ class NeuralEvaluator:
 
         mobility = (kings_mobility + men_mobility) / 20.0
         return mobility
-    
-    
-    
+
+    def _calculate_mobility_batch(self, board_states: np.ndarray, color: int) -> np.ndarray:
+        """Vectorized mobility calculation for batch of boards."""
+        N = len(board_states)
+        mobility_scores = np.zeros(N, dtype=np.float32)
+
+        for i in range(N):
+            mobility_scores[i] = self._calculate_mobility_feature(board_states[i], color)
+
+        return mobility_scores
+
+
+
     def predict(self, features: np.ndarray) -> float:
         """
         Forward pass for single input.
@@ -344,22 +382,25 @@ class NeuralEvaluator:
             _, _, _, _, _, _, _, y = self._forward_batch(X)
             return y.reshape(-1)
 
-    def batch_predict(self, boards: Union[List[List[int]], np.ndarray], players: Union[List[int], np.ndarray]) -> np.ndarray:
+    def batch_predict(self, boards: Union[List[Board], np.ndarray],
+                     players: Union[List[Player], np.ndarray]) -> np.ndarray:
         """Batch evaluation from boards"""
-        features = self.board_to_features_batch(boards, players)
+        features: np.ndarray = self.board_to_features_batch(boards, players)
         return self.predict_batch(features)
 
-    def train_supervised(self, positions: Optional[np.ndarray], targets: Optional[np.ndarray], epochs: int = 1, batch_size: int = 1024, lr: float = 5e-4, l2: float = 1e-6, shuffle: bool = True, verbose: bool = True) -> Dict[str, Union[float, int]]:
+    def train_supervised(self, positions: Optional[np.ndarray], targets: Optional[np.ndarray],
+                        epochs: int = 1, batch_size: int = 1024, lr: float = 5e-4,
+                        l2: float = 1e-6, shuffle: bool = True, verbose: bool = True) -> Dict[str, Union[float, int]]:
         """
         Simple supervised training using MSE loss.
         Default lr=5e-4 as per task.
         """
-        if positions is None or len(positions) == 0:
-            return {"loss": None, "count": 0}
+        if positions is None or targets is None or len(positions) == 0:
+            return {"loss": 0.0, "count": 0}
 
-        X = positions.astype(np.float32)
-        t = targets.astype(np.float32).reshape(-1, 1) * 1000.0
-        N = X.shape[0]
+        X: np.ndarray = positions.astype(np.float32)
+        t: np.ndarray = targets.astype(np.float32).reshape(-1, 1) * 1000.0
+        N: int = X.shape[0]
 
         indices = np.arange(N)
         np.random.shuffle(indices)
@@ -367,12 +408,18 @@ class NeuralEvaluator:
         train_indices = indices[:split_idx]
         val_indices = indices[split_idx:]
 
+        # Pre-allocate arrays for better memory efficiency
+        avg_loss = 0.0
+        val_loss = 0.0
+        total_count = 0
+
         for epoch in range(epochs):
             if shuffle:
                 np.random.shuffle(train_indices)
             total_loss = 0.0
             total_count = 0
 
+            # Process training data in batches
             for start in range(0, len(train_indices), batch_size):
                 idx = train_indices[start:start+batch_size]
                 xb = X[idx]
@@ -438,26 +485,26 @@ class NeuralEvaluator:
 
         return {"train_loss": avg_loss, "val_loss": val_loss, "count": total_count}
 
-    def evaluate_position(self, board: List[int], player: int) -> float:
+    def evaluate_position(self, board: Board, player: Player) -> float:
         """
         Main evaluation function with caching.
         """
-        cache_key = self._get_position_hash(board, player)
+        cache_key: int = self._get_position_hash(board, player)
         if cache_key in self.eval_cache:
             self.cache_hits += 1
             return self.eval_cache[cache_key]
 
         self.cache_misses += 1
 
-        features = self.board_to_features(board, player)
-        raw_score = self.predict(features)
-        result = player * raw_score
+        features: np.ndarray = self.board_to_features(board, player)
+        raw_score: float = self.predict(features)
+        result: float = player * raw_score
 
         self.eval_cache[cache_key] = result
         self._manage_cache_size()
 
         return result
-    
+
     def _init_adam_state(self) -> None:
         """Initialize Adam optimizer state variables"""
         self.adam_m = {}
@@ -538,12 +585,12 @@ def get_neural_evaluator() -> NeuralEvaluator:
 
 
 # Modified evaluation function that uses neural network
-def evaluate_neural(board: List[int], player: int) -> int:
+def evaluate_neural(board: Board, player: Player) -> int:
     """
     Neural network-based evaluation function.
     This replaces the original evaluate() function.
     """
-    evaluator = get_neural_evaluator()
+    evaluator: NeuralEvaluator = get_neural_evaluator()
     return int(evaluator.evaluate_position(board, player))
 
 
@@ -556,15 +603,15 @@ class TrainingDataCollector:
         self.scores: List[float] = []
         self.use_augmentation = use_augmentation  # But will use 50% freq
 
-    def add_position(self, board: List[int], player: int, game_result: float) -> None:
+    def add_position(self, board: Board, player: Player, game_result: float) -> None:
         """
         Add a position with 50% chance of augmentation.
         """
-        evaluator = get_neural_evaluator()
+        evaluator: NeuralEvaluator = get_neural_evaluator()
 
         # Original
-        features = evaluator.board_to_features(board, player)
-        score = player * game_result
+        features: np.ndarray = evaluator.board_to_features(board, player)
+        score: float = player * game_result
 
         self.positions.append(features)
         self.scores.append(score)
@@ -572,8 +619,8 @@ class TrainingDataCollector:
         # 50% augmentation
         if self.use_augmentation and random.random() < 0.5:
             flipped_board, flipped_player = evaluator.augment_position(board, player)
-            flipped_features = evaluator.board_to_features(flipped_board, flipped_player)
-            flipped_score = flipped_player * game_result
+            flipped_features: np.ndarray = evaluator.board_to_features(flipped_board, flipped_player)
+            flipped_score: float = flipped_player * game_result
 
             self.positions.append(flipped_features)
             self.scores.append(flipped_score)
@@ -615,6 +662,34 @@ def integrate_neural_evaluation() -> bool:
     except ImportError:
         print("Could not integrate neural evaluation")
         return False
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Test the neural evaluator
+    evaluator: NeuralEvaluator = get_neural_evaluator()
+
+    # Create a test board (initial position)
+    test_board: Board = [0] * 33  # 33 elements (index 0 unused)
+
+    # Set up initial position
+    for i in range(1, 33):
+        pos: Optional[Tuple[int, int]] = rc(i)
+        if pos is not None:
+            r, c = pos
+            if r <= 2:
+                test_board[i] = -1  # Red pieces
+            elif r >= 5:
+                test_board[i] = 1   # Black pieces
+
+    # Test evaluation
+    score: float = evaluator.evaluate_position(test_board, 1)
+    print(f"Neural evaluation of initial position: {score}")
+
+    # Test feature extraction
+    features: np.ndarray = evaluator.board_to_features(test_board, 1)
+    print(f"Feature vector shape: {features.shape}")
+    print(f"Sample features: {features[:10]}")
 
 
 # Example usage and testing

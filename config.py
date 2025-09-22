@@ -11,10 +11,13 @@ from typing import Dict, Any, Optional, List, Tuple, Union
 from pydantic import BaseModel, Field, validator
 
 
-# Type aliases for better readability
+# Type aliases for better readability (avoiding circular imports)
 Board = List[int]
 Move = List[int]
 GameResult = Tuple[int, Optional[Move]]
+Player = int  # 1 for black, -1 for red
+ConfigDict = Dict[str, Any]
+SettingsDict = Dict[str, Union[str, int, float, bool]]
 
 
 class UISettings(BaseModel):
@@ -37,11 +40,15 @@ class EngineSettings(BaseModel):
     """Game engine configuration settings."""
 
     default_depth: int = Field(default=6, ge=1, le=10, description="Default search depth")
-    batch_size: int = Field(default=32, ge=1, le=1024, description="Neural evaluation batch size")
-    tt_max_size: int = Field(default=100000, ge=1000, description="Transposition table max size")
-    max_cache_size: int = Field(default=10000, ge=1000, description="Evaluation cache max size")
+    batch_size: int = Field(default=64, ge=1, le=1024, description="Neural evaluation batch size (increased for better GPU utilization)")
+    tt_max_size: int = Field(default=200000, ge=1000, description="Transposition table max size (doubled for better caching)")
+    max_cache_size: int = Field(default=20000, ge=1000, description="Evaluation cache max size (doubled for better performance)")
     aspiration_margin: int = Field(default=100, ge=1, description="Aspiration search margin")
     null_move_reduction: int = Field(default=3, ge=1, description="Null move pruning depth reduction")
+    # New performance optimization settings
+    use_iterative_deepening: bool = Field(default=True, description="Use iterative deepening for better move ordering")
+    parallel_search: bool = Field(default=False, description="Enable parallel search (experimental)")
+    cache_compression: bool = Field(default=True, description="Enable cache compression for memory efficiency")
 
     @validator('default_depth', 'batch_size', 'tt_max_size', 'max_cache_size', 'aspiration_margin', 'null_move_reduction')
     def validate_int_fields(cls, v):
@@ -51,12 +58,16 @@ class EngineSettings(BaseModel):
 class TrainingSettings(BaseModel):
     """Neural network training configuration."""
 
-    learning_rate: float = Field(default=5e-4, gt=0, le=1.0, description="Training learning rate")
-    epochs: int = Field(default=1, ge=1, le=100, description="Number of training epochs")
-    batch_size: int = Field(default=1024, ge=32, le=8192, description="Training batch size")
+    learning_rate: float = Field(default=1e-3, gt=0, le=1.0, description="Training learning rate (increased for faster convergence)")
+    epochs: int = Field(default=2, ge=1, le=100, description="Number of training epochs (increased for better learning)")
+    batch_size: int = Field(default=2048, ge=32, le=8192, description="Training batch size (doubled for better GPU utilization)")
     l2_regularization: float = Field(default=1e-6, ge=0, description="L2 regularization strength")
     train_val_split: float = Field(default=0.8, gt=0, lt=1, description="Train/validation split ratio")
     shuffle_training: bool = Field(default=True, description="Shuffle training data")
+    # New training optimizations
+    use_mixed_precision: bool = Field(default=False, description="Use mixed precision training for faster computation")
+    gradient_clipping: float = Field(default=1.0, ge=0, description="Gradient clipping threshold")
+    early_stopping_patience: int = Field(default=10, ge=0, description="Early stopping patience")
 
     @validator('learning_rate', 'l2_regularization', 'train_val_split')
     def validate_float_fields(cls, v):
@@ -262,6 +273,7 @@ LOG_LEVEL = os.environ.get("CHECKERS_LOG_LEVEL", "INFO").upper()
 
 
 def ensure_dirs() -> None:
+    """Ensure required directories exist."""
     for d in (DATA_DIR, MODELS_DIR):
         if d and not os.path.exists(d):
             os.makedirs(d, exist_ok=True)
@@ -271,7 +283,7 @@ def setup_logging() -> None:
     """Configure root logging once, controlled by env var CHECKERS_LOG_LEVEL."""
     if getattr(setup_logging, "_configured", False):
         return
-    level = getattr(logging, LOG_LEVEL, logging.INFO)
+    level: int = getattr(logging, LOG_LEVEL, logging.INFO)
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
