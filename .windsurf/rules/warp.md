@@ -17,3 +17,4 @@ Changelog (auto-updated)
 - Phase 2: Introduced Evaluator and SearchStrategy interfaces with adapters (checkers/eval.py, checkers/search.py) and added tests (test_interfaces.py).
 - Phase 3: Upgraded config validation for rules (captures_mandatory et al.) to Pydantic v2 field validators.
 - Phase 4: Added docs/README.md and integration test (test_integration.py).
+- Config: Migrated remaining Pydantic v1 validators to v2 field_validator in config.py to remove deprecation warnings.

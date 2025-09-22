@@ -31,7 +31,8 @@ class UISettings(BaseModel):
     show_borders: bool = Field(default=True, description="Show board borders")
     highlight_moves: bool = Field(default=True, description="Highlight legal move destinations")
 
-    @validator('use_color', 'use_unicode', 'show_indices', 'compact', 'animations', 'show_borders', 'highlight_moves')
+    @field_validator('use_color', 'use_unicode', 'show_indices', 'compact', 'animations', 'show_borders', 'highlight_moves', mode='before')
+    @classmethod
     def validate_bool_fields(cls, v):
         return bool(v)
 
@@ -50,7 +51,8 @@ class EngineSettings(BaseModel):
     parallel_search: bool = Field(default=False, description="Enable parallel search (experimental)")
     cache_compression: bool = Field(default=True, description="Enable cache compression for memory efficiency")
 
-    @validator('default_depth', 'batch_size', 'tt_max_size', 'max_cache_size', 'aspiration_margin', 'null_move_reduction')
+    @field_validator('default_depth', 'batch_size', 'tt_max_size', 'max_cache_size', 'aspiration_margin', 'null_move_reduction', mode='before')
+    @classmethod
     def validate_int_fields(cls, v):
         return int(v)
 
@@ -69,7 +71,8 @@ class TrainingSettings(BaseModel):
     gradient_clipping: float = Field(default=1.0, ge=0, description="Gradient clipping threshold")
     early_stopping_patience: int = Field(default=10, ge=0, description="Early stopping patience")
 
-    @validator('learning_rate', 'l2_regularization', 'train_val_split')
+    @field_validator('learning_rate', 'l2_regularization', 'train_val_split', mode='before')
+    @classmethod
     def validate_float_fields(cls, v):
         return float(v)
 
@@ -97,12 +100,14 @@ class LoggingSettings(BaseModel):
     enable_profiling: bool = Field(default=False, description="Enable performance profiling")
     profile_output_dir: str = Field(default="profiles", description="Profile output directory")
 
-    @validator('log_level')
+    @field_validator('log_level', mode='before')
+    @classmethod
     def validate_log_level(cls, v):
         valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR']
-        if v.upper() not in valid_levels:
+        v_upper = v.upper() if isinstance(v, str) else str(v).upper()
+        if v_upper not in valid_levels:
             raise ValueError(f"log_level must be one of {valid_levels}")
-        return v.upper()
+        return v_upper
 
 
 class CheckersConfig(BaseModel):

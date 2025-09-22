@@ -30,3 +30,6 @@ Phase 3 summary:
 
 Phase 4 summary:
 - Added lightweight docs in docs/README.md and an end-to-end integration test (test_integration.py).
+
+Config migration:
+- Replaced remaining Pydantic v1 @validator usage in UISettings, EngineSettings, TrainingSettings, and LoggingSettings with @field_validator to remove warnings.
