@@ -15,3 +15,6 @@ This file provides guidance to agents when working with code in this repository.
 - Shared Manager.dict() for TT in multiprocessing.
 - Tests: root-level [`test_curriculum.py`](test_curriculum.py), [`test_improvements.py`](test_improvements.py); require torch/numba for full coverage.
 - Pre-commit pytest: --maxfail=1 --disable-warnings -q on all files.
+
+Documentation
+- Consolidated architecture and roadmap: see architecture_and_todo.md

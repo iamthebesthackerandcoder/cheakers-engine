@@ -91,3 +91,6 @@ Key notes
 - Optional accelerators: install as needed for speedups (e.g., pip install numba torch). CuPy may require a CUDA-specific wheel
 - Hooks: pre-commit includes black, ruff (with --fix), ruff-format, mypy, and a pytest sanity run
 - Data/models: artifacts are saved under data/ by default; checkpoints contain model state and training stats
+
+Documentation
+- Consolidated architecture and roadmap: see architecture_and_todo.md
