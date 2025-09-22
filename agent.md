@@ -19,3 +19,8 @@ Next recommended steps:
 Additional changes (2025-09-22):
 - Made TrainingDataCollector augmentation deterministic when enabled (always adds flipped sample) to align with tests.
 - Ensured backward compatibility: train_supervised now returns 'loss' alongside 'train_loss'/'val_loss' for benchmarks.
+
+Phase 2 summary:
+- Added Evaluator ABC and NeuralEvaluatorAdapter in checkers/eval.py.
+- Added SearchStrategy ABC and AlphaBetaSearchStrategy in checkers/search.py.
+- Added tests (test_interfaces.py) to validate adapters and factories.
