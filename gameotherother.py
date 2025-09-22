@@ -186,21 +186,12 @@ def _gen_captures_from(board: Board, idx: SquareIndex, player: Player,
 
 
 def legal_moves(board: Board, player: Player) -> List[Move]:
-    """Generate all legal moves for a player."""
-    captures: List[Move] = []
-    quiets: List[Move] = []
-    for i in range(1, SQUARES + 1):
-        v: int = board[i]
-        if v * player <= 0:
-            continue
-        caps: List[Move] = _gen_captures_from(board, i, player)
-        if caps:
-            captures.extend(caps)
-        else:
-            quiets.extend(_gen_simple_moves(board, i, player))
-    if captures:
-        return captures if CAPTURES_MANDATORY else captures + quiets
-    return quiets
+    """Generate all legal moves for a player via the new MoveGenerator abstraction."""
+    # Local import to avoid circular import during module initialization
+    from checkers.moves import MoveGenerator
+
+    generator = MoveGenerator(captures_mandatory=CAPTURES_MANDATORY)
+    return generator.legal_moves(board, player)
 
 
 # ============================

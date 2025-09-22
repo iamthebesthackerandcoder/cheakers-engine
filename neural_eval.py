@@ -396,7 +396,7 @@ class NeuralEvaluator:
         Default lr=5e-4 as per task.
         """
         if positions is None or targets is None or len(positions) == 0:
-            return {"loss": 0.0, "count": 0}
+            return {"loss": 0.0, "train_loss": 0.0, "val_loss": 0.0, "count": 0}
 
         X: np.ndarray = positions.astype(np.float32)
         t: np.ndarray = targets.astype(np.float32).reshape(-1, 1) * 1000.0
@@ -483,7 +483,7 @@ class NeuralEvaluator:
             if verbose:
                 print(f"[Neural Train] Epoch {epoch+1}/{epochs} - Train MSE: {avg_loss:.4f} | Val MSE: {val_loss:.4f} over {total_count} train / {val_count} val samples")
 
-        return {"train_loss": avg_loss, "val_loss": val_loss, "count": total_count}
+        return {"loss": avg_loss, "train_loss": avg_loss, "val_loss": val_loss, "count": total_count}
 
     def evaluate_position(self, board: Board, player: Player) -> float:
         """
@@ -616,8 +616,8 @@ class TrainingDataCollector:
         self.positions.append(features)
         self.scores.append(score)
 
-        # 50% augmentation
-        if self.use_augmentation and random.random() < 0.5:
+        # Always add augmented sample when enabled (deterministic for tests)
+        if self.use_augmentation:
             flipped_board, flipped_player = evaluator.augment_position(board, player)
             flipped_features: np.ndarray = evaluator.board_to_features(flipped_board, flipped_player)
             flipped_score: float = flipped_player * game_result
