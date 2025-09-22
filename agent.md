@@ -24,3 +24,6 @@ Phase 2 summary:
 - Added Evaluator ABC and NeuralEvaluatorAdapter in checkers/eval.py.
 - Added SearchStrategy ABC and AlphaBetaSearchStrategy in checkers/search.py.
 - Added tests (test_interfaces.py) to validate adapters and factories.
+
+Phase 3 summary:
+- Enhanced config validation for GameRulesSettings using Pydantic v2 field_validator for stricter runtime checks.

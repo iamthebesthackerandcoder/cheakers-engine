@@ -8,7 +8,7 @@ import os
 import logging
 import sys
 from typing import Dict, Any, Optional, List, Tuple, Union
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, field_validator
 
 
 # Type aliases for better readability (avoiding circular imports)
@@ -81,7 +81,9 @@ class GameRulesSettings(BaseModel):
     allow_undo: bool = Field(default=True, description="Allow undoing moves")
     auto_promotion: bool = Field(default=True, description="Auto-promote pieces to kings")
 
-    @validator('captures_mandatory', 'allow_undo', 'auto_promotion')
+    # Use Pydantic v2 style validators for stricter runtime validation
+    @field_validator('captures_mandatory', 'allow_undo', 'auto_promotion', mode='before')
+    @classmethod
     def validate_bool_fields(cls, v):
         return bool(v)
 

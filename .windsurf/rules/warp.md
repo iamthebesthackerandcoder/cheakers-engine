@@ -15,3 +15,4 @@ Changelog (auto-updated)
 - Updated TrainingDataCollector to always add an augmented sample when enabled to satisfy tests.
 - Added backward-compatible 'loss' key to neural_eval.train_supervised return dict for benchmark script compatibility.
 - Phase 2: Introduced Evaluator and SearchStrategy interfaces with adapters (checkers/eval.py, checkers/search.py) and added tests (test_interfaces.py).
+- Phase 3: Upgraded config validation for rules (captures_mandatory et al.) to Pydantic v2 field validators.
