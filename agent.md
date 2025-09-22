@@ -27,3 +27,6 @@ Phase 2 summary:
 
 Phase 3 summary:
 - Enhanced config validation for GameRulesSettings using Pydantic v2 field_validator for stricter runtime checks.
+
+Phase 4 summary:
+- Added lightweight docs in docs/README.md and an end-to-end integration test (test_integration.py).
